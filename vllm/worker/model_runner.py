@@ -22,7 +22,161 @@ _PAD_SLOT_ID = -1
 # NOTE: _get_graph_batch_size needs to be updated if this list is changed.
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
+def patch_model_with_openvino(model, model_config):
+    if hasattr(model, '_openvino_patch_orig_forward'):
+        return
+    # Replace forward with our stuff
+    import openvino as ov
 
+    import torch
+    import numpy as np
+    import openvino as ov
+    from vllm.model_executor.layers.attention import PagedAttention
+    from openvino.frontend.pytorch import ModuleExtension
+
+    from typing import Optional
+
+    import torch
+    from dataclasses import dataclass
+
+    @dataclass
+    class InputMetadata:
+        """Metadata for input sequences. Used in PagedAttention.
+
+        Args:
+            prompt_lens: Lengths of prompts.
+            slot_mapping: The address to write the new KV to of each token.
+            max_context_len: The maximum context length.
+            context_lens: the length of attention context for each sequence.
+            block_tables: The block tables. (Seq id -> list of physical block)
+            kv_cache_dtype: Data type to store kv cache.
+        """
+
+        def __init__(
+            self,
+            is_prompt: bool = False,
+            slot_mapping: torch.Tensor = None,
+            prompt_lens: Optional[torch.Tensor] = None,
+            max_seq_len: Optional[int] = None,
+            start_loc: Optional[torch.Tensor] = None,
+            max_context_len: Optional[int] = None,
+            context_lens: Optional[torch.Tensor] = None,
+            block_tables: Optional[torch.Tensor] = None,
+            use_cuda_graph: bool = False,
+            kv_cache_dtype: str = "auto",
+        ) -> None:
+            self.is_prompt = is_prompt
+            self.prompt_lens = prompt_lens
+            self.max_seq_len = max_seq_len
+            self.start_loc = start_loc
+            self.max_context_len = max_context_len
+            self.slot_mapping = slot_mapping
+            self.context_lens = context_lens
+            self.block_tables = block_tables
+            self.use_cuda_graph = use_cuda_graph
+            self.kv_cache_dtype = kv_cache_dtype
+
+            # Set during the execution of the first attention op.
+            # FIXME(woosuk): This is a hack.
+            self.attn_bias = None
+
+        def __repr__(self) -> str:
+            return ("InputMetadata("
+                    f"is_prompt={self.is_prompt}, "
+                    f"max_context_len={self.max_context_len}, "
+                    f"slot_mapping={self.slot_mapping}, "
+                    f"context_lens={self.context_lens}, "
+                    f"block_tables={self.block_tables}, "
+                    f"use_cuda_graph={self.use_cuda_graph}, "
+                    f"kv_cache_dtype={self.kv_cache_dtype})")
+
+    _PAD_SLOT_ID = -1
+
+    pt_model = model
+    _BATCH_SIZES_TO_CAPTURE = [2]
+    max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
+    input_tokens = torch.zeros(max_batch_size, 1, dtype=torch.long)
+    input_positions = torch.zeros(max_batch_size, 1,
+                                        dtype=torch.long)
+    slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long)
+    slot_mapping.fill_(_PAD_SLOT_ID)
+    context_lens = torch.ones(max_batch_size, dtype=torch.int32)
+
+    max_context_len_to_capture = (
+                model_config.max_context_len_to_capture
+                if model_config is not None else 0)
+    block_size = 8
+    max_num_blocks = (max_context_len_to_capture + block_size -
+                            1) // block_size
+    graph_block_tables = np.zeros(
+                (max(_BATCH_SIZES_TO_CAPTURE), max_num_blocks), dtype=np.int32)
+
+    block_tables = torch.from_numpy(graph_block_tables)
+
+    input_meta = {"slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
+
+    input_metadata = InputMetadata(
+                is_prompt=False,
+                slot_mapping=slot_mapping,
+                prompt_lens=None,
+                max_seq_len=256,
+                start_loc=None,
+                max_context_len=2048,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                use_cuda_graph=False,
+                kv_cache_dtype="auto",
+            )
+
+    kv_cache = [(torch.randn((1024, 12, 8, 16, 8), dtype=torch.float32), torch.rand((1024, 12, 8, 16, 8), dtype=torch.float32))] * 12
+
+    example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
+    class ModelWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, input_ids, position_ids, kv_cache, meta_dict):
+            input_meta = InputMetadata(**meta_dict)
+            return self.model(input_ids, position_ids, kv_cache, input_meta), kv_cache
+
+    model_wrapper = ModelWrapper(pt_model)
+    with torch.no_grad():
+        print('>>>>>>>>>>>>> CONVERTING OV MODEL')
+        ov_model = ov.convert_model(
+            model_wrapper,
+            example_input=example_input,
+            extension=[
+                ModuleExtension(
+                    PagedAttention,
+                    extension=lambda module: 'PagedAttentionPlaceholder',
+                    replacer=lambda module, *args, **kwargs: args[0],
+                    wrapper=lambda module, target_op, *args, **kwargs: target_op(args[0], args[1], args[2], args[3][1], args[4][1])
+                )
+            ]
+        )
+        print('>>>>>>>>>>>>> OV MODEL CONVERTED')
+        print(ov_model)
+    ov_compiled = ov.compile_model(ov_model)
+
+    # ov.save_model(, "opt_test.xml")
+
+    from functools import partial
+    def wrapper(*args, **kwargs):
+        print('MY WRAPPER')
+        print(f'model class: {type(args[0])}')
+        for i, input in enumerate(args[1:]):
+            print(f'[{i}]: {type(input)}')
+        for key, value in kwargs.items():
+            print(f'{key}: {type(value)}')
+        #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
+        # TODO: Unpack kv-cache inputs
+        result = ov_compiled(kwargs)
+        print(f'result: {type(result)}')
+        return result
+    print(' ============= PATCHING MODEL =============')
+    model._openvino_patch_orig_forward = model.forward
+    model.forward = partial(wrapper, model)
 class ModelRunner:
 
     def __init__(
@@ -456,6 +610,7 @@ class ModelRunner:
     ) -> Optional[SamplerOutput]:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
             self.prepare_input_tensors(seq_group_metadata_list))
+        patch_model_with_openvino(self.model, self.model_config)
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
