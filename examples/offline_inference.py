@@ -1,4 +1,5 @@
 from vllm import LLM, SamplingParams
+import torch
 
 # Sample prompts.
 prompts = [
@@ -11,7 +12,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-llm = LLM(model="facebook/opt-125m")
+llm = LLM(model="facebook/opt-125m", dtype=torch.float32, device='cpu')
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
