@@ -86,7 +86,7 @@ struct BF16Vec8 : public Vec<BF16Vec8> {
 
   explicit BF16Vec8(__m128bh data) : reg(data) {}
 
-  explicit BF16Vec8(__m256 v) : reg(_mm256_cvtneps_pbh(v)){};
+  explicit BF16Vec8(__m256 v) {};
 
   void save(void *ptr) const { *reinterpret_cast<__m128bh *>(ptr) = reg; }
 };
@@ -101,7 +101,7 @@ struct BF16Vec16 : public Vec<BF16Vec16> {
 
   explicit BF16Vec16(__m256bh data) : reg(data) {}
 
-  explicit BF16Vec16(__m512 v) : reg(_mm512_cvtneps_pbh(v)){};
+  explicit BF16Vec16(__m512 v) {};
 
   void save(void *ptr) const { *reinterpret_cast<__m256bh *>(ptr) = reg; }
 };
@@ -117,12 +117,7 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
   explicit BF16Vec32(__m512bh data) : reg(data) {}
 
   explicit BF16Vec32(BF16Vec8 &vec8_data)
-      : reg((__m512bh)_mm512_inserti32x4(
-            _mm512_inserti32x4(_mm512_inserti32x4(_mm512_castsi128_si512(
-                                                      (__m128i)vec8_data.reg),
-                                                  (__m128i)vec8_data.reg, 1),
-                               (__m128i)vec8_data.reg, 2),
-            (__m128i)vec8_data.reg, 3)) {}
+      {}
 
   void save(void *ptr) const { *reinterpret_cast<__m512bh *>(ptr) = reg; }
 };
@@ -136,11 +131,11 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
 
   __m256 reg;
 
-  explicit FP32Vec8(float v) : reg(_mm256_set1_ps(v)) {}
+  explicit FP32Vec8(float v) {}
 
-  explicit FP32Vec8() : reg(_mm256_set1_ps(0.0)) {}
+  explicit FP32Vec8()  {}
 
-  explicit FP32Vec8(const float *ptr) : reg(_mm256_loadu_ps(ptr)) {}
+  explicit FP32Vec8(const float *ptr) {}
 
   explicit FP32Vec8(__m256 data) : reg(data) {}
 
@@ -148,7 +143,7 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   explicit FP32Vec8(__m128h v) : reg(_mm256_cvtph_ps(_mm_castph_si128(v))) {}
 #endif
 
-  explicit FP32Vec8(__m128bh v) : reg(_mm256_cvtpbh_ps(v)) {}
+  explicit FP32Vec8(__m128bh v) {}
 
   float reduce_sum() const {
     AliasReg ar;
@@ -162,29 +157,26 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   FP32Vec8 exp() const {
     AliasReg ar;
     ar.reg = reg;
-    return FP32Vec8(_mm256_set_ps(expf(ar.values[7]), expf(ar.values[6]),
-                                  expf(ar.values[5]), expf(ar.values[4]),
-                                  expf(ar.values[3]), expf(ar.values[2]),
-                                  expf(ar.values[1]), expf(ar.values[0])));
+    return FP32Vec8();
   }
 
   FP32Vec8 operator*(const FP32Vec8 &b) const {
-    return FP32Vec8(_mm256_mul_ps(reg, b.reg));
+    return FP32Vec8();
   }
 
   FP32Vec8 operator+(const FP32Vec8 &b) const {
-    return FP32Vec8(_mm256_add_ps(reg, b.reg));
+    return FP32Vec8();
   }
 
   FP32Vec8 operator-(const FP32Vec8 &b) const {
-    return FP32Vec8(_mm256_sub_ps(reg, b.reg));
+    return FP32Vec8();
   }
 
   FP32Vec8 operator/(const FP32Vec8 &b) const {
-    return FP32Vec8(_mm256_div_ps(reg, b.reg));
+    return FP32Vec8();
   }
 
-  void save(float *ptr) const { _mm256_storeu_ps(ptr, reg); }
+  void save(float *ptr) const {}
 };
 
 struct FP32Vec16 : public Vec<FP32Vec16> {
@@ -196,22 +188,22 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
 
   __m512 reg;
 
-  explicit FP32Vec16(float v) : reg(_mm512_set1_ps(v)) {}
+  explicit FP32Vec16(float v)  {}
 
-  explicit FP32Vec16() : reg(_mm512_set1_ps(0.0)) {}
+  explicit FP32Vec16()  {}
 
-  explicit FP32Vec16(const float *ptr) : reg(_mm512_loadu_ps(ptr)) {}
+  explicit FP32Vec16(const float *ptr) {}
 
   explicit FP32Vec16(__m512 data) : reg(data) {}
 
-  explicit FP32Vec16(__m256bh v) : reg(_mm512_cvtpbh_ps(v)) {}
+  explicit FP32Vec16(__m256bh v) {}
 
   FP32Vec16 operator+(const FP32Vec16 &b) const {
-    return FP32Vec16(_mm512_add_ps(reg, b.reg));
+    return FP32Vec16();
   }
 
   FP32Vec16 operator*(const FP32Vec16 &b) const {
-    return FP32Vec16(_mm512_mul_ps(reg, b.reg));
+    return FP32Vec16();
   }
 
   float reduce_sum() const {
@@ -236,7 +228,7 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
     return ans;
   }
 
-  void save(float *ptr) const { _mm512_storeu_ps(ptr, reg); }
+  void save(float *ptr) const {  }
 };
 
 template <typename T> struct VecType { using vec_type = void; };
@@ -260,12 +252,11 @@ template <> inline void storeFP32ToT<c10::Half>(float v, c10::Half *ptr) {
 #endif
 
 inline FP32Vec16 fma(BF16Vec32 &a, BF16Vec32 &b, FP32Vec16 &c) {
-  return FP32Vec16(_mm512_dpbf16_ps(c.reg, a.reg, b.reg));
+  return FP32Vec16();
 }
 
 template <>
 inline void storeFP32ToT<c10::BFloat16>(float v, c10::BFloat16 *ptr) {
-  *reinterpret_cast<__bfloat16 *>(ptr) = _mm_cvtness_sbh(v);
 }
 
 }; // namespace vec_op

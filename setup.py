@@ -235,8 +235,7 @@ if BUILD_CPU_OPS:
     if BUILD_CPU_ONLY:
         CXX_FLAGS += ["-DVLLM_BUILD_CPU_ONLY"]
     CXX_FLAGS += [
-        "-DVLLM_BUILD_CPU_OPS", "-fopenmp", "-mavx512f", "-mavx512bf16",
-        "-mavx512vl"
+        "-DVLLM_BUILD_CPU_OPS", "-fopenmp"
     ]
     CPU_OPS_SOURCES += [
         "csrc/cpu/activation_impl.cpp",
