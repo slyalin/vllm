@@ -113,6 +113,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
 
     block_tables = torch.from_numpy(graph_block_tables)
 
+    #TODO: Take real max_seq_len from somewhere
     input_meta = {"is_prompt": torch.tensor(False), "slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
 
     fp_type = torch.float32
@@ -207,20 +208,20 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
                 input_tensor.get_node().set_element_type(ov_dtype_maping[input_data.dtype])
             if input_tensor.partial_shape.rank.is_dynamic:
                 input_tensor.get_node().set_partial_shape(ov.PartialShape([-1]*input_data.ndim))
-            input_tensor.get_tensor().set_names({input_name})
+            #input_tensor.get_tensor().set_names({input_name})
 
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        ov.save_model(ov_model, "vllm_openvino_model.xml")
+        #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         print(ov_model)
     ov_compiled = ov.compile_model(ov_model)
 
     from functools import partial
     def wrapper(*args, **kwargs):
-        print('MY WRAPPER')
-        print(f'model class: {type(args[0])}')
+        print('OV FORWARD WRAPPER')
+        #print(f'model class: {type(args[0])}')
         #for i, input in enumerate(args[1:]):
         #    print(f'[{i}]: {type(input)}')
         #for key, value in kwargs.items():
@@ -228,12 +229,18 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
         input_metadata = kwargs['input_metadata']
         #print(dir(input_metadata))
+        #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
         inputs = [
             kwargs['input_ids'],
             kwargs['positions'],
             *flattenize_inputs(kwargs['kv_caches']),
-            input_metadata.is_prompt, input_metadata.slot_mapping, 256#, input_metadata.max_context_len, input_metadata.context_lens
+            input_metadata.is_prompt, input_metadata.slot_mapping
         ]
+        if input_metadata.max_context_len is not None:
+            # available from the second iteration
+            inputs.append(input_metadata.max_context_len)
+            inputs.append(input_metadata.context_lens)
+            inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
         result = ov_compiled(inputs, share_outputs=False)
