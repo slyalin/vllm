@@ -113,7 +113,7 @@ def patch_model_with_openvino(model, model_config):
 
     block_tables = torch.from_numpy(graph_block_tables)
 
-    input_meta = {"slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
+    input_meta = {"is_prompt": torch.tensor(False), "slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
 
     input_metadata = InputMetadata(
                 is_prompt=False,
@@ -128,7 +128,9 @@ def patch_model_with_openvino(model, model_config):
                 kv_cache_dtype="auto",
             )
 
-    kv_cache = [(torch.randn((1024, 12, 8, 16, 8), dtype=torch.float32), torch.rand((1024, 12, 8, 16, 8), dtype=torch.float32))] * 12
+    fp_type = torch.float32
+
+    kv_cache = [(torch.randn((3640, 12, 16, 16, 4), dtype=fp_type), torch.rand((3640, 12, 64, 16), dtype=fp_type))] * 12
 
     example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
     class ModelWrapper(torch.nn.Module):
@@ -138,23 +140,74 @@ def patch_model_with_openvino(model, model_config):
 
         def forward(self, input_ids, position_ids, kv_cache, meta_dict):
             input_meta = InputMetadata(**meta_dict)
-            return self.model(input_ids, position_ids, kv_cache, input_meta), kv_cache
+            return self.model(input_ids, position_ids, kv_cache, input_meta)
+
 
     model_wrapper = ModelWrapper(pt_model)
+
+    num_heads = pt_model.config.num_attention_heads
+    embed_dim = pt_model.config.hidden_size
+    head_dim = embed_dim // num_heads
+    scale = head_dim**-0.5
+
+    ov_dtype_maping = {
+        torch.bool: ov.Type.boolean,
+        torch.float32: ov.Type.f32,
+        torch.float16: ov.Type.f16,
+        torch.bfloat16: ov.Type.bf16,
+        torch.int32: ov.Type.i32,
+        torch.int64: ov.Type.i64
+    }
+
+
+    def flattenize_inputs(inputs):
+        """
+        Helper function for making nested inputs flattens
+        """
+        flatten_inputs = []
+        for input_data in inputs:
+            if input_data is None:
+                continue
+            if isinstance(input_data, (list, tuple)):
+                flatten_inputs.extend(flattenize_inputs(input_data))
+            elif isinstance(input_data, dict):
+                flatten_inputs.extend(flattenize_inputs(list(input_data.values())))
+            else:
+                flatten_inputs.append(input_data)
+        return flatten_inputs
+
+    flatten_input = flattenize_inputs(example_input)
+    input_names = ["input_ids", "position_ids"]
+    output_names = ["logits"]
+
+    for i in range(12):
+        input_names.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
+
+    input_names.extend(list(input_meta))
+
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
-        ov_model = ov.convert_model(
-            model_wrapper,
-            example_input=example_input,
-            extension=[
-                ModuleExtension(
+        ov_model =  ov.convert_model(
+                model_wrapper,
+                example_input=example_input,
+                extension=[ModuleExtension(
                     PagedAttention,
                     extension=lambda module: 'PagedAttentionPlaceholder',
                     replacer=lambda module, *args, **kwargs: args[0],
-                    wrapper=lambda module, target_op, *args, **kwargs: target_op(args[0], args[1], args[2], args[3][1], args[4][1])
+                    wrapper=lambda module, target_op, *args, **kwargs: target_op(args[0], args[1], args[2], args[3], args[4], args[5].is_prompt, args[5].slot_mapping, args[5].max_context_len, args[5].context_lens, args[5].block_tables, scale)
+                    )]
                 )
-            ]
-        )
+
+        for input_name, input_data, input_tensor in zip(input_names, flatten_input, ov_model.inputs):
+            if input_tensor.element_type.is_dynamic():
+                input_tensor.get_node().set_element_type(ov_dtype_maping[input_data.dtype])
+            if input_tensor.partial_shape.rank.is_dynamic:
+                input_tensor.get_node().set_partial_shape(ov.PartialShape([-1]*input_data.ndim))
+            input_tensor.get_tensor().set_names({input_name})
+
+        for out_name, out in zip(output_names, ov_model.outputs):
+            out.get_tensor().set_names({out_name})
+        ov_model.validate_nodes_and_infer_types()
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         print(ov_model)
     ov_compiled = ov.compile_model(ov_model)
@@ -165,15 +218,24 @@ def patch_model_with_openvino(model, model_config):
     def wrapper(*args, **kwargs):
         print('MY WRAPPER')
         print(f'model class: {type(args[0])}')
-        for i, input in enumerate(args[1:]):
-            print(f'[{i}]: {type(input)}')
-        for key, value in kwargs.items():
-            print(f'{key}: {type(value)}')
+        #for i, input in enumerate(args[1:]):
+        #    print(f'[{i}]: {type(input)}')
+        #for key, value in kwargs.items():
+        #    print(f'{key}: {type(value)}')
         #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
-        # TODO: Unpack kv-cache inputs
-        result = ov_compiled(kwargs)
-        print(f'result: {type(result)}')
-        return result
+        input_metadata = kwargs['input_metadata']
+        #print(dir(input_metadata))
+        inputs = [
+            kwargs['input_ids'],
+            kwargs['positions'],
+            *flattenize_inputs(kwargs['kv_caches']),
+            input_metadata.is_prompt, input_metadata.slot_mapping, 256#, input_metadata.max_context_len, input_metadata.context_lens
+        ]
+        #for input in inputs:
+        #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
+        result = ov_compiled(inputs, share_outputs=False)
+        #print(f'result: {type(result)}')
+        return torch.from_numpy(result[0])
     print(' ============= PATCHING MODEL =============')
     model._openvino_patch_orig_forward = model.forward
     model.forward = partial(wrapper, model)
