@@ -148,7 +148,6 @@ def patch_model_with_openvino(model, model_config):
     num_heads = pt_model.config.num_attention_heads
     embed_dim = pt_model.config.hidden_size
     head_dim = embed_dim // num_heads
-    scale = head_dim**-0.5
 
     ov_dtype_maping = {
         torch.bool: ov.Type.boolean,
@@ -185,18 +184,35 @@ def patch_model_with_openvino(model, model_config):
 
     input_names.extend(list(input_meta))
 
+    def wrapper(module, target_op, *args, **kwargs):
+        return target_op(
+                            args[0],
+                            args[1],
+                            args[2],
+                            args[3],
+                            args[4],
+                            args[5].is_prompt,
+                            args[5].slot_mapping,
+                            args[5].max_context_len,
+                            args[5].context_lens,
+                            args[5].block_tables,
+                            torch.tensor(module.scale)
+                        )
+
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
         ov_model =  ov.convert_model(
-                model_wrapper,
-                example_input=example_input,
-                extension=[ModuleExtension(
+            model_wrapper,
+            example_input=example_input,
+            extension=[
+                ModuleExtension(
                     PagedAttention,
                     extension=lambda module: 'PagedAttentionPlaceholder',
                     replacer=lambda module, *args, **kwargs: args[0],
-                    wrapper=lambda module, target_op, *args, **kwargs: target_op(args[0], args[1], args[2], args[3], args[4], args[5].is_prompt, args[5].slot_mapping, args[5].max_context_len, args[5].context_lens, args[5].block_tables, scale)
-                    )]
+                    wrapper=wrapper
                 )
+            ]
+        )
 
         for input_name, input_data, input_tensor in zip(input_names, flatten_input, ov_model.inputs):
             if input_tensor.element_type.is_dynamic():
@@ -208,11 +224,10 @@ def patch_model_with_openvino(model, model_config):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
+        ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         print(ov_model)
     ov_compiled = ov.compile_model(ov_model)
-
-    # ov.save_model(, "opt_test.xml")
 
     from functools import partial
     def wrapper(*args, **kwargs):
