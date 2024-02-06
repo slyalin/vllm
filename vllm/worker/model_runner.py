@@ -22,7 +22,7 @@ _PAD_SLOT_ID = -1
 # NOTE: _get_graph_batch_size needs to be updated if this list is changed.
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
-def patch_model_with_openvino(model, model_config):
+def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
     # Replace forward with our stuff
@@ -113,23 +113,12 @@ def patch_model_with_openvino(model, model_config):
 
     block_tables = torch.from_numpy(graph_block_tables)
 
+    #TODO: Take real max_seq_len from somewhere
     input_meta = {"is_prompt": torch.tensor(False), "slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
-
-    input_metadata = InputMetadata(
-                is_prompt=False,
-                slot_mapping=slot_mapping,
-                prompt_lens=None,
-                max_seq_len=256,
-                start_loc=None,
-                max_context_len=2048,
-                context_lens=context_lens,
-                block_tables=block_tables,
-                use_cuda_graph=False,
-                kv_cache_dtype="auto",
-            )
 
     fp_type = torch.float32
 
+    #TODO: Take example tensors from model_args/model_kwargs
     kv_cache = [(torch.randn((3640, 12, 16, 16, 4), dtype=fp_type), torch.rand((3640, 12, 64, 16), dtype=fp_type))] * 12
 
     example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
@@ -219,20 +208,20 @@ def patch_model_with_openvino(model, model_config):
                 input_tensor.get_node().set_element_type(ov_dtype_maping[input_data.dtype])
             if input_tensor.partial_shape.rank.is_dynamic:
                 input_tensor.get_node().set_partial_shape(ov.PartialShape([-1]*input_data.ndim))
-            input_tensor.get_tensor().set_names({input_name})
+            #input_tensor.get_tensor().set_names({input_name})
 
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        ov.save_model(ov_model, "vllm_openvino_model.xml")
+        #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         print(ov_model)
     ov_compiled = ov.compile_model(ov_model)
 
     from functools import partial
     def wrapper(*args, **kwargs):
-        print('MY WRAPPER')
-        print(f'model class: {type(args[0])}')
+        print('OV FORWARD WRAPPER')
+        #print(f'model class: {type(args[0])}')
         #for i, input in enumerate(args[1:]):
         #    print(f'[{i}]: {type(input)}')
         #for key, value in kwargs.items():
@@ -240,12 +229,18 @@ def patch_model_with_openvino(model, model_config):
         #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
         input_metadata = kwargs['input_metadata']
         #print(dir(input_metadata))
+        #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
         inputs = [
             kwargs['input_ids'],
             kwargs['positions'],
             *flattenize_inputs(kwargs['kv_caches']),
-            input_metadata.is_prompt, input_metadata.slot_mapping, 256#, input_metadata.max_context_len, input_metadata.context_lens
+            input_metadata.is_prompt, input_metadata.slot_mapping
         ]
+        if input_metadata.max_context_len is not None:
+            # available from the second iteration
+            inputs.append(input_metadata.max_context_len)
+            inputs.append(input_metadata.context_lens)
+            inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
         result = ov_compiled(inputs, share_outputs=False)
@@ -687,7 +682,12 @@ class ModelRunner:
     ) -> Optional[SamplerOutput]:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
             self.prepare_input_tensors(seq_group_metadata_list))
-        patch_model_with_openvino(self.model, self.model_config)
+        # passing input data as well to ease process of model conversion
+        patch_model_with_openvino(self.model, self.model_config,
+                                    input_ids=input_tokens,
+                                    positions=input_positions,
+                                    kv_caches=kv_caches,
+                                    input_metadata=input_metadata)
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
