@@ -196,26 +196,26 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             extension=[
                 ModuleExtension(
                     PagedAttention,
-                    extension=lambda module: 'PagedAttentionPlaceholder',
+                    extension=lambda module: 'PagedAttentionExtension',
                     replacer=lambda module, *args, **kwargs: args[0],
                     wrapper=wrapper
-                )
+                ),
+                'libuser_ov_extensions.so'
             ]
         )
 
-        for input_name, input_data, input_tensor in zip(input_names, flatten_input, ov_model.inputs):
+        for input_data, input_tensor in zip(flatten_input, ov_model.inputs):
             if input_tensor.element_type.is_dynamic():
                 input_tensor.get_node().set_element_type(ov_dtype_maping[input_data.dtype])
             if input_tensor.partial_shape.rank.is_dynamic:
                 input_tensor.get_node().set_partial_shape(ov.PartialShape([-1]*input_data.ndim))
-            #input_tensor.get_tensor().set_names({input_name})
 
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
         #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
-        print(ov_model)
+        #print(ov_model)
     ov_compiled = ov.compile_model(ov_model)
 
     from functools import partial
@@ -243,6 +243,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
+        #print('input_metadata.slot_mapping:', input_metadata.slot_mapping)
         result = ov_compiled(inputs, share_outputs=False)
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
