@@ -235,7 +235,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
         def prepare_data(t):
             t = np.array(t, copy=False)
-            print(t.__array_interface__['data'][0])
+            #print(t.__array_interface__['data'][0])
             assert t.flags["C_CONTIGUOUS"]
             return t
         flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
