@@ -25,6 +25,7 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
+    # model._openvino_patch_orig_forward = model.forward
     # Replace forward with our stuff
     import openvino as ov
 
@@ -187,6 +188,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
                             args[5].block_tables,
                             torch.tensor(module.scale)
                         )
+    # def wrapper(module, target_op, *args, **kwargs):
+    #     return args[0]
 
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
@@ -200,7 +203,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
                     replacer=lambda module, *args, **kwargs: args[0],
                     wrapper=wrapper
                 ),
-                'libuser_ov_extensions.so'
+                '/home/developer/notebook/openvino_contrib/modules/custom_operations/build/user_ie_extensions/libuser_ov_extensions.so'
             ]
         )
 
@@ -216,7 +219,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         #print(ov_model)
-    ov_compiled = ov.compile_model(ov_model)
+    ov_compiled = ov.compile_model(ov_model, device_name='CPU')
 
     from functools import partial
     def wrapper(*args, **kwargs):
@@ -230,12 +233,22 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         input_metadata = kwargs['input_metadata']
         #print(dir(input_metadata))
         #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
+        def prepare_data(t):
+            t = np.array(t, copy=False)
+            print(t.__array_interface__['data'][0])
+            assert t.flags["C_CONTIGUOUS"]
+            return t
+        flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
+        total_size = sum([torch.numel(t) for t in flatten_kv_cache])
+        print(f'kv-cache total size: {total_size}')
+        flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
         inputs = [
             kwargs['input_ids'],
             kwargs['positions'],
-            *flattenize_inputs(kwargs['kv_caches']),
+            *flatten_kv_cache,
             input_metadata.is_prompt, input_metadata.slot_mapping
         ]
+        print('slot_mapping:', input_metadata.slot_mapping)
         if input_metadata.max_context_len is not None:
             # available from the second iteration
             inputs.append(input_metadata.max_context_len)
@@ -244,7 +257,10 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
         #print('input_metadata.slot_mapping:', input_metadata.slot_mapping)
-        result = ov_compiled(inputs, share_outputs=False)
+        start = time.time()
+        result = ov_compiled(inputs)
+        end = time.time()
+        print(f'Timing for ov_compiled(inputs): {1000*(end - start)} ms')
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
     print(' ============= PATCHING MODEL =============')
@@ -695,12 +711,15 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
+        start = time.time()
         hidden_states = model_executable(
             input_ids=input_tokens,
             positions=input_positions,
             kv_caches=kv_caches,
             input_metadata=input_metadata,
         )
+        end = time.time()
+        print(f'Model inference took {1000*(end - start)} ms')
 
         # Sample the next token.
         output = self.model.sample(
