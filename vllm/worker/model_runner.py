@@ -1,4 +1,5 @@
 import time
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -15,6 +16,8 @@ from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import in_wsl
 
 logger = init_logger(__name__)
+
+is_openvino = True if os.getenv('VLLM_OPENVINO', "0") == "1" else False
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 _PAD_SLOT_ID = -1
@@ -120,7 +123,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     fp_type = torch.float32
 
     #TODO: Take example tensors from model_args/model_kwargs
-    kv_cache = [(torch.randn((3640, 12, 16, 16, 4), dtype=fp_type), torch.rand((3640, 12, 64, 16), dtype=fp_type))] * 12
+    kv_cache = [(torch.ones((3640, 12, 16, 16, 4), dtype=fp_type), torch.ones((3640, 12, 64, 16), dtype=fp_type))] * 12
 
     example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
     class ModelWrapper(torch.nn.Module):
@@ -203,7 +206,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
                     replacer=lambda module, *args, **kwargs: args[0],
                     wrapper=wrapper
                 ),
-                '/home/developer/notebook/openvino_contrib/modules/custom_operations/build/user_ie_extensions/libuser_ov_extensions.so'
+                "libuser_ov_extensions.so"
             ]
         )
 
@@ -218,8 +221,13 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         ov_model.validate_nodes_and_infer_types()
         #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
-        #print(ov_model)
-    ov_compiled = ov.compile_model(ov_model, device_name='CPU')
+        print(ov_model)
+
+    core = ov.Core()
+    core.add_extension("libuser_ov_extensions.so")
+    ov_config = {ov.properties.enable_profiling: True}
+    ov_compiled = core.compile_model(ov_model, "CPU", config=ov_config)
+    ov_request = ov_compiled.create_infer_request()
 
     from functools import partial
     def wrapper(*args, **kwargs):
@@ -256,16 +264,14 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-        #print('input_metadata.slot_mapping:', input_metadata.slot_mapping)
-        start = time.time()
-        result = ov_compiled(inputs)
-        end = time.time()
-        print(f'Timing for ov_compiled(inputs): {1000*(end - start)} ms')
+        result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
     print(' ============= PATCHING MODEL =============')
     model._openvino_patch_orig_forward = model.forward
     model.forward = partial(wrapper, model)
+
+
 class ModelRunner:
 
     def __init__(
@@ -700,11 +706,12 @@ class ModelRunner:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
             self.prepare_input_tensors(seq_group_metadata_list))
         # passing input data as well to ease process of model conversion
-        patch_model_with_openvino(self.model, self.model_config,
-                                    input_ids=input_tokens,
-                                    positions=input_positions,
-                                    kv_caches=kv_caches,
-                                    input_metadata=input_metadata)
+        if is_openvino:
+            patch_model_with_openvino(self.model, self.model_config,
+                                        input_ids=input_tokens,
+                                        positions=input_positions,
+                                        kv_caches=kv_caches,
+                                        input_metadata=input_metadata)
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
