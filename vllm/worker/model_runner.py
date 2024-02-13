@@ -28,6 +28,7 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
+    print(' ============= PATCHING MODEL =============')
     # model._openvino_patch_orig_forward = model.forward
     # Replace forward with our stuff
     import openvino as ov
@@ -221,17 +222,16 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         ov_model.validate_nodes_and_infer_types()
         #ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
-        print(ov_model)
+        #print(ov_model)
 
     core = ov.Core()
-    core.add_extension("libuser_ov_extensions.so")
     ov_config = {ov.properties.enable_profiling: True}
     ov_compiled = core.compile_model(ov_model, "CPU", config=ov_config)
     ov_request = ov_compiled.create_infer_request()
 
     from functools import partial
     def wrapper(*args, **kwargs):
-        print('OV FORWARD WRAPPER')
+        #print('OV FORWARD WRAPPER')
         #print(f'model class: {type(args[0])}')
         #for i, input in enumerate(args[1:]):
         #    print(f'[{i}]: {type(input)}')
@@ -247,8 +247,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             assert t.flags["C_CONTIGUOUS"]
             return t
         flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
-        total_size = sum([torch.numel(t) for t in flatten_kv_cache])
-        print(f'kv-cache total size: {total_size}')
+        #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
+        #print(f'kv-cache total size: {total_size}')
         flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
         inputs = [
             kwargs['input_ids'],
@@ -256,7 +256,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             *flatten_kv_cache,
             input_metadata.is_prompt, input_metadata.slot_mapping
         ]
-        print('slot_mapping:', input_metadata.slot_mapping)
+        #print('slot_mapping:', input_metadata.slot_mapping)
         if input_metadata.max_context_len is not None:
             # available from the second iteration
             inputs.append(input_metadata.max_context_len)
@@ -267,7 +267,6 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
-    print(' ============= PATCHING MODEL =============')
     model._openvino_patch_orig_forward = model.forward
     model.forward = partial(wrapper, model)
 
