@@ -179,21 +179,21 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     input_names.extend(list(input_meta))
 
     def wrapper(module, target_op, *args, **kwargs):
+        # this function will replace entier PageAttention module
+        # target_op is PageAttentionExtension, the order of arguments below should match the extension signature
         return target_op(
-                            args[0],
-                            args[1],
-                            args[2],
-                            args[3],
-                            args[4],
-                            args[5].is_prompt,
-                            args[5].slot_mapping,
-                            args[5].max_context_len,
-                            args[5].context_lens,
-                            args[5].block_tables,
-                            torch.tensor(module.scale)
-                        )
-    # def wrapper(module, target_op, *args, **kwargs):
-    #     return args[0]
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5].is_prompt,
+            args[5].slot_mapping,
+            args[5].max_context_len,
+            args[5].context_lens,
+            args[5].block_tables,
+            torch.tensor(module.scale)  # wrap in a tensor, otherwise it will not appear in the trace
+        )
 
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
@@ -203,9 +203,9 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             extension=[
                 ModuleExtension(
                     PagedAttention,
-                    extension=lambda module: 'PagedAttentionExtension',
-                    replacer=lambda module, *args, **kwargs: args[0],
-                    wrapper=wrapper
+                    target_op='PagedAttentionExtension',
+                    evaluate=lambda module, *args, **kwargs: args[0],  # need this because PagedAttention module fails in torch.jit.trace
+                    convert=wrapper
                 ),
                 "libuser_ov_extensions.so"
             ]
