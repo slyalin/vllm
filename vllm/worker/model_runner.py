@@ -25,6 +25,9 @@ _PAD_SLOT_ID = -1
 # NOTE: _get_graph_batch_size needs to be updated if this list is changed.
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
+current_iteration_idx = 0
+total_time_second_token = 0
+
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
@@ -122,9 +125,14 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     input_meta = {"is_prompt": torch.tensor(False), "slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
 
     fp_type = torch.float32
+    num_heads = pt_model.config.num_attention_heads
+    head_size = pt_model.config.hidden_size
+    head_dim = head_size // num_heads
 
+    # // value_cache: shape = [num_blocks, num_kv_heads, head_size, block_size]
+    # // key_cache: shape [num_blocks, num_kv_heads, head_size/x, block_size, x]
     #TODO: Take example tensors from model_args/model_kwargs
-    kv_cache = [(torch.ones((3640, 12, 16, 16, 4), dtype=fp_type), torch.ones((3640, 12, 64, 16), dtype=fp_type))] * 12
+    kv_cache = [(torch.ones((3640, 12, 16, 16, 4), dtype=fp_type), torch.ones((3640, 12, 64, 16), dtype=fp_type))] * model_config.hf_config.num_hidden_layers
 
     example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
     class ModelWrapper(torch.nn.Module):
@@ -138,10 +146,6 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
 
 
     model_wrapper = ModelWrapper(pt_model)
-
-    num_heads = pt_model.config.num_attention_heads
-    embed_dim = pt_model.config.hidden_size
-    head_dim = embed_dim // num_heads
 
     ov_dtype_maping = {
         torch.bool: ov.Type.boolean,
@@ -220,12 +224,14 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        #ov.save_model(ov_model, "vllm_openvino_model.xml")
+        # ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         #print(ov_model)
 
     core = ov.Core()
+    core.add_extension("libuser_ov_extensions.so")
     ov_config = {ov.properties.enable_profiling: True}
+    # ov_config = {}
     ov_compiled = core.compile_model(ov_model, "CPU", config=ov_config)
     ov_request = ov_compiled.create_infer_request()
 
@@ -264,7 +270,12 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-        result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
+        result = ov_request.infer(inputs, share_inputs=True, share_outputs=True)
+        total_time = 0
+        for perf in ov_request.get_profiling_info():
+            print(f"Operation: {perf.node_name}, Latency: {perf.cpu_time}, Impl: {perf.exec_type}")
+            total_time += perf.cpu_time.total_seconds()*1000
+        print(f"Total time: {total_time}")
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
     model._openvino_patch_orig_forward = model.forward
@@ -725,7 +736,14 @@ class ModelRunner:
             input_metadata=input_metadata,
         )
         end = time.time()
-        print(f'Model inference took {1000*(end - start)} ms')
+        global current_iteration_idx
+        global total_time_second_token
+        if current_iteration_idx == 0:
+            print(f'First inference latency took {1000*(end - start)} ms')
+        else:
+            total_time_second_token += 1000 * (end - start)
+            print(f'Second token average latency {total_time_second_token/current_iteration_idx} ms, iterations {current_iteration_idx}')
+        current_iteration_idx += 1
 
         # Sample the next token.
         output = self.model.sample(

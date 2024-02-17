@@ -30,11 +30,12 @@ class SiluAndMul(nn.Module):
         return (F.silu(x[..., :d].float()) * x[..., d:].float()).to(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        ops.silu_and_mul(out, x)
-        return out
+        # d = x.shape[-1] // 2
+        # output_shape = (x.shape[:-1] + (d, ))
+        # out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        # ops.silu_and_mul(out, x)
+        # return out
+        return self._forward(x)
 
 
 class NewGELU(nn.Module):
