@@ -206,7 +206,9 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             args[5].max_context_len,
             args[5].context_lens,
             args[5].block_tables,
-            torch.tensor(module.scale)  # wrap in a tensor, otherwise it will not appear in the trace
+            torch.tensor(module.scale),  # wrap in a tensor, otherwise it will not appear in the trace
+            torch.tensor(module.alibi_slopes if module.alibi_slopes is not None else [], dtype=torch.float32),  # alibi_slopes
+            torch.tensor(module.sliding_window if module.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
         )
 
     with torch.no_grad():
