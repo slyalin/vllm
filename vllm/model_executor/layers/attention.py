@@ -24,7 +24,6 @@ _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
 
-current_spda = 0
 
 class PagedAttention(nn.Module):
     """MHA/MQA/GQA layer with PagedAttention.
@@ -90,15 +89,6 @@ class PagedAttention(nn.Module):
         Returns:
             shape = [batch_size, seq_len, num_heads * head_size]
         """
-        global current_spda
-
-        # print(f"Current SPDA {current_spda}")
-        # print(query.flatten()[0:20])
-        # print(key.flatten()[0:20])
-        # print(value.flatten()[0:20])
-        # current_spda += 1
-        # exit(1)
-
         batch_size, seq_len, hidden_size = query.shape
         # Reshape the query, key, and value tensors.
         query = query.view(-1, self.num_heads, self.head_size)
@@ -121,8 +111,6 @@ class PagedAttention(nn.Module):
         if input_metadata.is_prompt:
             # Prompt run.
             if self.num_kv_heads != self.num_heads:
-                print("MQA/GQA")
-                exit(1)
                 # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
                 # project the key and value tensors to the desired number of
                 # heads.
@@ -146,8 +134,6 @@ class PagedAttention(nn.Module):
                     attn_bias = BlockDiagonalCausalMask.from_seqlens(
                         [seq_len] * batch_size)
                     if self.sliding_window is not None:
-                        print("if self.sliding_window is not None")
-                        exit(1)
                         attn_bias = attn_bias.make_local_attention(
                             self.sliding_window)
                     if self.cpu_only:

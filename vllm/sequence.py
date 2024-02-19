@@ -69,7 +69,6 @@ class SequenceData:
         self.cumulative_logprob = 0.0
 
     def append_token_id(self, token_id: int, logprob: float) -> None:
-        # print(f"append_token_id: {token_id}, {logprob}")
         self.output_token_ids.append(token_id)
         self.cumulative_logprob += logprob
 

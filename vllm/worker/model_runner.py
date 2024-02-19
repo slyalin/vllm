@@ -156,6 +156,16 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         torch.int64: ov.Type.i64
     }
 
+    # avoid usage of vllm._C.ops
+    from vllm.model_executor.layers.activation import SiluAndMul, NewGELU, FastGELU
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    SiluAndMul.forward = SiluAndMul._forward
+    NewGELU.forward = NewGELU._forward
+    FastGELU.forward = FastGELU._forward
+    RMSNorm.forward = RMSNorm._forward
+    RotaryEmbedding.forward = RotaryEmbedding._forward
 
     def flattenize_inputs(inputs):
         """
@@ -270,12 +280,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             inputs.append(input_metadata.block_tables)
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-        result = ov_request.infer(inputs, share_inputs=True, share_outputs=True)
-        total_time = 0
-        for perf in ov_request.get_profiling_info():
-            print(f"Operation: {perf.node_name}, Latency: {perf.cpu_time}, Impl: {perf.exec_type}")
-            total_time += perf.cpu_time.total_seconds()*1000
-        print(f"Total time: {total_time}")
+        result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
     model._openvino_patch_orig_forward = model.forward
