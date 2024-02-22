@@ -18,6 +18,7 @@ from vllm.utils import in_wsl
 logger = init_logger(__name__)
 
 is_openvino = True if os.getenv('VLLM_OPENVINO', "0") == "1" else False
+is_openvino_optimum_intel = True if os.getenv('VLLM_OPENVINO_OPTIMUM', "0") == "1" else False
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 _PAD_SLOT_ID = -1
@@ -27,6 +28,24 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
 current_iteration_idx = 0
 total_time_second_token = 0
+
+
+def flattenize_inputs(inputs):
+    """
+    Helper function for making nested inputs flattens
+    """
+    flatten_inputs = []
+    for input_data in inputs:
+        if input_data is None:
+            continue
+        if isinstance(input_data, (list, tuple)):
+            flatten_inputs.extend(flattenize_inputs(input_data))
+        elif isinstance(input_data, dict):
+            flatten_inputs.extend(flattenize_inputs(list(input_data.values())))
+        else:
+            flatten_inputs.append(input_data)
+    return flatten_inputs
+
 
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
@@ -167,22 +186,6 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     RMSNorm.forward = RMSNorm._forward
     RotaryEmbedding.forward = RotaryEmbedding._forward
 
-    def flattenize_inputs(inputs):
-        """
-        Helper function for making nested inputs flattens
-        """
-        flatten_inputs = []
-        for input_data in inputs:
-            if input_data is None:
-                continue
-            if isinstance(input_data, (list, tuple)):
-                flatten_inputs.extend(flattenize_inputs(input_data))
-            elif isinstance(input_data, dict):
-                flatten_inputs.extend(flattenize_inputs(list(input_data.values())))
-            else:
-                flatten_inputs.append(input_data)
-        return flatten_inputs
-
     flatten_input = flattenize_inputs(example_input)
     input_names = ["input_ids", "position_ids"]
     output_names = ["logits"]
@@ -236,7 +239,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        # ov.save_model(ov_model, "vllm_openvino_model.xml")
+        ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
         #print(ov_model)
 
@@ -289,6 +292,131 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     model.forward = partial(wrapper, model)
 
 
+def patch_stateful_model(model):
+    from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput
+    from openvino.runtime import opset13
+    from openvino.runtime.utils.node_factory import NodeFactory
+    from openvino.runtime.utils import replace_node
+    factory = NodeFactory()
+    factory.add_extension("libuser_ov_extensions.so")
+
+    #model.remove_parameter(model.input('beam_idx').get_node())
+    model_remaining_params = [
+        opset13.parameter(shape=[], dtype=bool),  # is_prompt
+        opset13.parameter(shape=[-1, -1], dtype=np.int64),  # slot mapping
+        opset13.parameter(shape=[], dtype=np.int32),  # max_context_len
+        opset13.parameter(shape=[-1], dtype=np.int32),  # context_lens
+        opset13.parameter(shape=[-1, -1], dtype=np.int32),  # block_tables
+    ]
+    paged_attention_remaining_args = [
+        *model_remaining_params,
+        opset13.constant(0.125),  # scale
+        opset13.constant([]),  # alibi_slopes
+        opset13.constant(0),  # sliding_window
+    ]
+
+    kv_parameters = []
+    assignes_to_remove = []
+    position_ids_parameter = []
+
+    class StateManagementPattern(MatcherPass):
+        def __init__(self):
+            MatcherPass.__init__(self)
+            self.model_changed = False
+
+            k_past = WrapType("opset13.ReadValue", AnyInput().output(0))
+            k_gather = WrapType("opset13.Gather", [k_past.output(0), AnyInput().output(0), AnyInput().output(0)])
+            k_current = AnyInput()
+            k_concat = WrapType("opset13.Concat", [k_gather.output(0), k_current.output(0)])
+            v_past = WrapType("opset13.ReadValue", AnyInput().output(0))
+            v_gather = WrapType("opset13.Gather", [v_past.output(0), AnyInput().output(0), AnyInput().output(0)])
+            v_current = AnyInput()
+            v_concat = WrapType("opset13.Concat", [v_gather.output(0), v_current.output(0)])
+            q = AnyInput()
+            sdpa = WrapType("opset13.ScaledDotProductAttention", [q.output(0), k_concat.output(0), v_concat.output(0), AnyInput().output(0)])
+            print('[ DEBUG ] 3')
+
+            def callback(m: Matcher) -> bool:
+                print('SDPA TRIGGERED')
+                assert sdpa in m.get_pattern_value_map()
+                mapping = m.get_pattern_value_map()
+                assert sdpa in mapping
+                #sdpa = m.get_match_root()
+                real_sdpa = mapping[sdpa]
+                real_q = mapping[q]
+                real_k = mapping[k_current]
+                real_v = mapping[v_current]
+                # q = sdpa.input_value(0)
+                # k = sdpa.input_value(1)
+                # v = sdpa.input_value(2)
+                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=np.float32)
+                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=np.float32)
+                kv_parameters.append(k_parameter)
+                kv_parameters.append(v_parameter)
+                q_transpose = opset13.transpose(real_q, opset13.constant([0, 2, 1, 3]))
+                q_reshape = opset13.reshape(q_transpose, opset13.constant([0, 0, -1]), True)
+                k_transpose = opset13.transpose(real_k, opset13.constant([0, 2, 1, 3]))
+                k_reshape = opset13.reshape(k_transpose, opset13.constant([0, 0, -1]), True)
+                v_transpose = opset13.transpose(real_v, opset13.constant([0, 2, 1, 3]))
+                v_reshape = opset13.reshape(v_transpose, opset13.constant([0, 0, -1]), True)
+                paged_attention = factory.create("PagedAttentionExtension", [q_reshape, k_reshape, v_reshape, k_parameter, v_parameter, *paged_attention_remaining_args])
+                pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, 64], True)
+                pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
+
+                def add_assign_consumers(output):
+                    for consumer in output.get_target_inputs():
+                        consumer_node = consumer.get_node()
+                        if consumer_node.get_type_info().name == 'Assign':
+                            print('Remove Assign')
+                            assignes_to_remove.append(consumer_node)
+
+                add_assign_consumers(mapping[k_concat])
+                add_assign_consumers(mapping[v_concat])
+                replace_node(m.get_match_root(), pa_transpose)
+                return True
+
+            self.register_matcher(Matcher(sdpa, "StateAndSDPA"), callback)
+
+    class PositionIDsReplacer(MatcherPass):
+        def __init__(self):
+            MatcherPass.__init__(self)
+            self.model_changed = False
+
+            input_ids = AnyInput()
+            input_embed = WrapType("opset13.Gather", [AnyInput().output(0), input_ids.output(0), AnyInput().output(0)])
+
+            position_ids = AnyInput()
+            offset = WrapType('opset13.Constant')
+            add_offset = WrapType('opset13.Add', [position_ids, offset])
+            convert = WrapType('opset13.Convert', [add_offset])
+            position_embed = WrapType("opset13.Gather", [AnyInput().output(0), convert.output(0), AnyInput().output(0)])
+
+            add = WrapType("opset13.Add", [input_embed, position_embed])
+
+            def callback(m: Matcher) -> bool:
+                print('ADD TRANSFORM TRIGGERED')
+                mapping = m.get_pattern_value_map()
+                position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
+                replace_node(mapping[position_ids].get_node(), position_ids_parameter[0])
+                return True
+
+            self.register_matcher(Matcher(add, "InputAndPoistionIDsAdd"), callback)
+
+    m = Manager()
+    m.set_per_pass_validation(False)
+    m.register_pass(StateManagementPattern())
+    if 'position_ids' not in sum([list(t.get_names()) for t in model.inputs], []):
+        print('POSITION ID REPLACER REGISTERED')
+        m.register_pass(PositionIDsReplacer())
+    m.run_passes(model)
+    model.remove_parameter(model.input('beam_idx').get_node())
+    model.remove_parameter(model.input('attention_mask').get_node())
+    model.add_parameters(position_ids_parameter)
+    model.add_parameters(kv_parameters)
+    model.add_parameters(model_remaining_params)
+    for sink in assignes_to_remove:
+        model.remove_sink(sink)
+
 class ModelRunner:
 
     def __init__(
@@ -328,7 +456,65 @@ class ModelRunner:
         self.in_wsl = in_wsl()
 
     def load_model(self) -> None:
-        self.model = get_model(self.model_config)
+        if is_openvino_optimum_intel:
+            from optimum.intel import OVModelForCausalLM
+            self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, stateful=True) # need stateful because it also enables SDPA
+            patch_stateful_model(self.model.model)
+            import openvino as ov
+            ov.serialize(self.model.model, 'vllm_openvino_model.xml')
+            core = ov.Core()
+            ov_compiled = core.compile_model(self.model.model, "CPU")
+            ov_request = ov_compiled.create_infer_request()
+
+            from functools import partial
+            def wrapper(*args, **kwargs):
+                #print('OV FORWARD WRAPPER')
+                #print(f'model class: {type(args[0])}')
+                #for i, input in enumerate(args[1:]):
+                #    print(f'[{i}]: {type(input)}')
+                #for key, value in kwargs.items():
+                #    print(f'{key}: {type(value)}')
+                #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
+                input_metadata = kwargs['input_metadata']
+                #print(dir(input_metadata))
+                #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
+                def prepare_data(t):
+                    t = np.array(t, copy=False)
+                    #print(t.__array_interface__['data'][0])
+                    assert t.flags["C_CONTIGUOUS"]
+                    return t
+                flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
+                #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
+                #print(f'kv-cache total size: {total_size}')
+                flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
+                inputs = [
+                    kwargs['input_ids'],
+                    kwargs['positions'],
+                    *flatten_kv_cache,
+                    input_metadata.is_prompt, input_metadata.slot_mapping
+                ]
+                #print('slot_mapping:', input_metadata.slot_mapping)
+                if input_metadata.max_context_len is not None:
+                    # available from the second iteration
+                    inputs.append(input_metadata.max_context_len)
+                    inputs.append(input_metadata.context_lens)
+                    inputs.append(input_metadata.block_tables)
+                #for input in inputs:
+                #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
+                result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
+                #print(f'result: {type(result)}')
+                return torch.from_numpy(result[0])
+            self.model._openvino_patch_orig_forward = self.model.forward
+            self.model.forward = partial(wrapper, self.model)
+
+            # self.vllm_model = get_model(self.model_config)
+            # def sample_wrapper(*args, **kwargs):
+            #     return self.vllm_model.sample(*args, hidden_states=None, **kwargs)
+            # self.model.sample = sample_wrapper
+            from vllm.model_executor.layers.sampler import Sampler
+            self.sampler = Sampler(self.model_config.hf_config.vocab_size)
+        else:
+            self.model = get_model(self.model_config)
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
@@ -723,7 +909,7 @@ class ModelRunner:
         input_tokens, input_positions, input_metadata, sampling_metadata = (
             self.prepare_input_tensors(seq_group_metadata_list))
         # passing input data as well to ease process of model conversion
-        if is_openvino:
+        if is_openvino and not is_openvino_optimum_intel:
             patch_model_with_openvino(self.model, self.model_config,
                                         input_ids=input_tokens,
                                         positions=input_positions,
@@ -753,10 +939,24 @@ class ModelRunner:
         current_iteration_idx += 1
 
         # Sample the next token.
-        output = self.model.sample(
-            hidden_states=hidden_states,
-            sampling_metadata=sampling_metadata,
-        )
+        if is_openvino_optimum_intel:
+            # TODO: In OpenVINO case we still doing logits compute in the model for all output tokens, which is not
+            #       an efficient approach for pre-fill as a part of the values are dropped in the sampler below.
+            #       So, the better appraoch is to fuse the gather/slice on hidden state directly to the model and do
+            #       a part of the work that sampler does in the model itself. Alternative apprach is to return real hidden_states
+            #       from the model as an output dropping a final MatMul in the end of the model but it will lead to MatMul compute
+            #       in vanilla torch in the sampler below.
+            output = self.sampler(  # calling sampler directly (not sample method) to avoid modifying vLLM model classes
+                embedding=None,  # won't be used because logits are passed as another argument
+                hidden_states=None,
+                sampling_metadata=sampling_metadata,
+                logits=hidden_states,  # hidden state is not really a hidden state in openvino, it is already logits
+            )
+        else:
+            output = self.model.sample(
+                hidden_states=hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
         return output
 
     @torch.inference_mode()
