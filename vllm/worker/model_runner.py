@@ -1,6 +1,7 @@
 import time
 import os
 from typing import Dict, List, Optional, Tuple, Union
+import math
 
 import numpy as np
 import torch
@@ -306,15 +307,13 @@ def patch_stateful_model(model):
     #model.remove_parameter(model.input('beam_idx').get_node())
     max_context_len = opset13.parameter(shape=[], dtype=np.int32, name='max_context_len')  # max_context_len
     model_remaining_params = [
-        opset13.parameter(shape=[], dtype=bool),  # is_prompt
-        opset13.parameter(shape=[-1, -1], dtype=np.int64),  # slot mapping
+        opset13.parameter(shape=[], dtype=bool, name='is_prompt'),  # is_prompt
+        opset13.parameter(shape=[-1, -1], dtype=np.int64, name='slot_mapping'),  # slot mapping
         max_context_len,
-        opset13.parameter(shape=[-1], dtype=np.int32),  # context_lens
-        opset13.parameter(shape=[-1, -1], dtype=np.int32),  # block_tables
+        opset13.parameter(shape=[-1], dtype=np.int32, name='context_lens'),  # context_lens
+        opset13.parameter(shape=[-1, -1], dtype=np.int32, name='block_tables'),  # block_tables
     ]
     paged_attention_remaining_args = [
-        *model_remaining_params,
-        opset13.constant(0.125),  # scale  TODO: compute real value
         opset13.constant([]),  # alibi_slopes
         opset13.constant(0),  # sliding_window
     ]
@@ -367,18 +366,32 @@ def patch_stateful_model(model):
                 real_q = mapping[q]
                 real_k = mapping[k_current]
                 real_v = mapping[v_current]
+                hidden_shape = real_q.get_partial_shape()
+                hidden_dim = hidden_shape[hidden_shape.rank.get_length() - 1].get_length()  # TODO: What if it is a dynamic? Need to insert a ShapeOf sub-graph instead
                 k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=np.float32)
                 v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=np.float32)
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
+                # TODO: The rank 4 is used in the following code, but it is not guaranteed for all models, adopt to other ranks.
                 q_transpose = opset13.transpose(real_q, opset13.constant([0, 2, 1, 3]))
                 q_reshape = opset13.reshape(q_transpose, opset13.constant([0, 0, -1]), True)
                 k_transpose = opset13.transpose(real_k, opset13.constant([0, 2, 1, 3]))
                 k_reshape = opset13.reshape(k_transpose, opset13.constant([0, 0, -1]), True)
                 v_transpose = opset13.transpose(real_v, opset13.constant([0, 2, 1, 3]))
                 v_reshape = opset13.reshape(v_transpose, opset13.constant([0, 0, -1]), True)
-                paged_attention = factory.create("PagedAttentionExtension", [q_reshape, k_reshape, v_reshape, k_parameter, v_parameter, *paged_attention_remaining_args])
-                pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, 64], True)  # FIXME: 64 is hardcoded, take ShapeOf instead
+                # TODO: Detect whether SDPA in the model graph has scale argument set and use it instead of the computed scale below
+                scale = opset13.constant(np.array(1.0/math.sqrt(float(hidden_dim)), dtype=np.float32))
+                paged_attention = factory.create("PagedAttentionExtension", [
+                    q_reshape,
+                    k_reshape,
+                    v_reshape,
+                    k_parameter,
+                    v_parameter,
+                    *model_remaining_params,
+                    scale,
+                    *paged_attention_remaining_args
+                ])
+                pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, hidden_dim], True)
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
                 # def add_kv_parameter(past_node):
@@ -429,6 +442,8 @@ def patch_stateful_model(model):
 
             self.register_matcher(Matcher(seq, "MaxSequenceLengthPattern"), callback)
 
+    # TODO: Instead of using the following transformation that matches quite a specific place in a model graph in case when position_ids parameter is missing,
+    #       consider replacing always existing attention_mask parameter with a sub-graph using a new slot_mapping parameter.
     class PositionIDsReplacer(MatcherPass):
         def __init__(self):
             MatcherPass.__init__(self)
@@ -449,8 +464,9 @@ def patch_stateful_model(model):
                 mapping = m.get_pattern_value_map()
                 if not position_ids_parameter:
                     position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
+                    print('CREATED A NEW position_ids PARAMETER')
                 replace_node(mapping[position_ids].get_node(), position_ids_parameter[0])
-                print('INSERTED NEW PARAMETER: position_ids')
+                print('APPLIED position_ids PARAMETER INSTEAD OF attention_mask-BASED SUB-GRAPH')
                 return True
 
             self.register_matcher(Matcher(add, "InputAndPoistionIDsAdd"), callback)
@@ -473,9 +489,9 @@ def patch_stateful_model(model):
     if has_parameter(model, 'beam_idx'):
         model.remove_parameter(model.input('beam_idx').get_node())
     model.remove_parameter(model.input('attention_mask').get_node())
-    print('parameters_to_remove:', parameters_to_remove)
-    print('results_to_remove:', results_to_remove)
-    print('sinks_to_remove:', assignes_to_remove)
+    # print('parameters_to_remove:', parameters_to_remove)
+    # print('results_to_remove:', results_to_remove)
+    # print('sinks_to_remove:', assignes_to_remove)
     for parameter in parameters_to_remove:
         model.remove_parameter(parameter)
     for sink in assignes_to_remove:
