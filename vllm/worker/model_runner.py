@@ -339,10 +339,10 @@ def patch_stateful_model(model):
             def kv_shaping(kv_concat):
                 interim = WrapType("opset13.StridedSlice", [kv_concat, *[AnyInput() for _ in range(3)]])
                 interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
-                interim = WrapType("opset13.Unsqueeze", [interim, AnyInput()])
+                unsqueeze = WrapType("opset13.Unsqueeze", [Or([kv_concat, interim]), AnyInput()])
+                interim = WrapType("opset13.StridedSlice", [unsqueeze, *[AnyInput() for _ in range(3)]])
                 interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
-                interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
-                interim = WrapType("opset13.Broadcast", [interim, AnyInput()])
+                interim = WrapType("opset13.Broadcast", [Or([unsqueeze, interim]), AnyInput()])
                 interim = WrapType("opset13.Reshape", [interim, AnyInput()])
                 return interim
 
@@ -530,7 +530,7 @@ class ModelRunner:
         if is_openvino_optimum_intel:
             import openvino as ov
             from optimum.intel import OVModelForCausalLM
-            self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, stateful=True) # need stateful because it also enables SDPA
+            self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, load_in_8bit=False) # need stateful because it also enables SDPA
             patch_stateful_model(self.model.model)
             ov.serialize(self.model.model, 'vllm_openvino_model.xml')
             core = ov.Core()
