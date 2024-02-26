@@ -1,6 +1,7 @@
 """A layer that samples the next tokens from the model's outputs."""
 from typing import Dict, List, Optional, Tuple
 
+import time
 import torch
 import torch.nn as nn
 
@@ -43,13 +44,14 @@ class Sampler(nn.Module):
             # Get the hidden states that we use for sampling.
             hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
 
+            start = time.time()
             # Get the logits for the next tokens.
             logits = _get_logits(hidden_states, embedding, embedding_bias,
                                 self.vocab_size)
+            end = time.time()
+            print(f'Out-of-model logits calculation (MatMul) took {(end - start)*1000} ms')
         else:
-            print('logits shape before prune', logits.shape)
             logits = _prune_hidden_states(logits, sampling_metadata)
-            print('logits shape after prune', logits.shape)
 
         # Only perform sampling in the driver worker.
         # Note: `_get_logits` is still distributed across TP workers because

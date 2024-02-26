@@ -50,7 +50,7 @@ def flattenize_inputs(inputs):
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
-    print(' ============= PATCHING MODEL =============')
+    print(' ============= PATCHING vLLM MODEL =============')
     # model._openvino_patch_orig_forward = model.forward
     # Replace forward with our stuff
     import openvino as ov
@@ -215,7 +215,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         )
 
     with torch.no_grad():
-        print('>>>>>>>>>>>>> CONVERTING OV MODEL')
+        print('CONVERTING vLLM MODEL TO OV MODEL')
         ov_model =  ov.convert_model(
             model_wrapper,
             example_input=example_input,
@@ -239,8 +239,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        ov.save_model(ov_model, "vllm_openvino_model.xml")
-        print('>>>>>>>>>>>>> OV MODEL CONVERTED')
+        #ov.save_model(ov_model, "vllm_openvino_model.xml")
+        print('MODEL IS CONVERTED')
         #print(ov_model)
 
     core = ov.Core()
@@ -283,6 +283,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             inputs.append(input_metadata.max_context_len)
             inputs.append(input_metadata.context_lens)
             inputs.append(input_metadata.block_tables)
+        else:
+            inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
         #for input in inputs:
         #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
         result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
@@ -293,7 +295,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
 
 
 def patch_stateful_model(model):
-    from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput
+    print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
+    from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
     from openvino.runtime.utils.node_factory import NodeFactory
     from openvino.runtime.utils import replace_node
@@ -301,16 +304,17 @@ def patch_stateful_model(model):
     factory.add_extension("libuser_ov_extensions.so")
 
     #model.remove_parameter(model.input('beam_idx').get_node())
+    max_context_len = opset13.parameter(shape=[], dtype=np.int32)  # max_context_len
     model_remaining_params = [
         opset13.parameter(shape=[], dtype=bool),  # is_prompt
         opset13.parameter(shape=[-1, -1], dtype=np.int64),  # slot mapping
-        opset13.parameter(shape=[], dtype=np.int32),  # max_context_len
+        max_context_len,
         opset13.parameter(shape=[-1], dtype=np.int32),  # context_lens
         opset13.parameter(shape=[-1, -1], dtype=np.int32),  # block_tables
     ]
     paged_attention_remaining_args = [
         *model_remaining_params,
-        opset13.constant(0.125),  # scale
+        opset13.constant(0.125),  # scale  TODO: compute real value
         opset13.constant([]),  # alibi_slopes
         opset13.constant(0),  # sliding_window
     ]
@@ -328,27 +332,40 @@ def patch_stateful_model(model):
             k_gather = WrapType("opset13.Gather", [k_past.output(0), AnyInput().output(0), AnyInput().output(0)])
             k_current = AnyInput()
             k_concat = WrapType("opset13.Concat", [k_gather.output(0), k_current.output(0)])
+
+            def any_input():
+                return AnyInput().output(0)
+
+            def kv_shaping(kv_concat):
+                interim = WrapType("opset13.StridedSlice", [kv_concat.output(0), *[any_input() for _ in range(3)]])
+                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
+                interim = WrapType("opset13.Unsqueeze", [interim.output(0), any_input()])
+                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
+                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
+                interim = WrapType("opset13.Broadcast", [interim.output(0), any_input()])
+                interim = WrapType("opset13.Reshape", [interim.output(0), any_input()])
+                return interim
+
             v_past = WrapType("opset13.ReadValue", AnyInput().output(0))
             v_gather = WrapType("opset13.Gather", [v_past.output(0), AnyInput().output(0), AnyInput().output(0)])
             v_current = AnyInput()
             v_concat = WrapType("opset13.Concat", [v_gather.output(0), v_current.output(0)])
+
             q = AnyInput()
-            sdpa = WrapType("opset13.ScaledDotProductAttention", [q.output(0), k_concat.output(0), v_concat.output(0), AnyInput().output(0)])
-            print('[ DEBUG ] 3')
+            sdpa = WrapType("opset13.ScaledDotProductAttention", [
+                q.output(0),
+                Or([k_concat.output(0), kv_shaping(k_concat).output(0)]).output(0),
+                Or([v_concat.output(0), kv_shaping(v_concat).output(0)]).output(0),
+                AnyInput().output(0)
+            ])
 
             def callback(m: Matcher) -> bool:
-                print('SDPA TRIGGERED')
                 assert sdpa in m.get_pattern_value_map()
                 mapping = m.get_pattern_value_map()
                 assert sdpa in mapping
-                #sdpa = m.get_match_root()
-                real_sdpa = mapping[sdpa]
                 real_q = mapping[q]
                 real_k = mapping[k_current]
                 real_v = mapping[v_current]
-                # q = sdpa.input_value(0)
-                # k = sdpa.input_value(1)
-                # v = sdpa.input_value(2)
                 k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=np.float32)
                 v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=np.float32)
                 kv_parameters.append(k_parameter)
@@ -360,22 +377,39 @@ def patch_stateful_model(model):
                 v_transpose = opset13.transpose(real_v, opset13.constant([0, 2, 1, 3]))
                 v_reshape = opset13.reshape(v_transpose, opset13.constant([0, 0, -1]), True)
                 paged_attention = factory.create("PagedAttentionExtension", [q_reshape, k_reshape, v_reshape, k_parameter, v_parameter, *paged_attention_remaining_args])
-                pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, 64], True)
+                pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, 64], True)  # FIXME: 64 is hardcoded, take ShapeOf instead
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
                 def add_assign_consumers(output):
                     for consumer in output.get_target_inputs():
                         consumer_node = consumer.get_node()
                         if consumer_node.get_type_info().name == 'Assign':
-                            print('Remove Assign')
                             assignes_to_remove.append(consumer_node)
 
                 add_assign_consumers(mapping[k_concat])
                 add_assign_consumers(mapping[v_concat])
                 replace_node(m.get_match_root(), pa_transpose)
+                print('INSERTED PageAttentionExtension')
                 return True
 
             self.register_matcher(Matcher(sdpa, "StateAndSDPA"), callback)
+
+    class MaxSequenceLengthPattern(MatcherPass):
+        def __init__(self):
+            MatcherPass.__init__(self)
+            self.model_changed = False
+
+            kv_past = WrapType("opset13.ReadValue", AnyInput().output(0))
+            kv_gather = WrapType("opset13.Gather", [kv_past.output(0), AnyInput().output(0), AnyInput().output(0)])
+            kv_shape = WrapType("opset13.ShapeOf", [kv_gather.output(0)])
+            seq = WrapType("opset13.Gather", [kv_shape.output(0), AnyInput().output(0), AnyInput().output(0)])
+
+            def callback(m: Matcher) -> bool:
+                replace_node(m.get_match_root(), max_context_len)
+                print("DETECTED PATTERN FOR max_sequence_length, CONNECTED TO A DEDICATED PARAMETER")
+                return True
+
+            self.register_matcher(Matcher(seq, "MaxSequenceLengthPattern"), callback)
 
     class PositionIDsReplacer(MatcherPass):
         def __init__(self):
@@ -394,10 +428,10 @@ def patch_stateful_model(model):
             add = WrapType("opset13.Add", [input_embed, position_embed])
 
             def callback(m: Matcher) -> bool:
-                print('ADD TRANSFORM TRIGGERED')
                 mapping = m.get_pattern_value_map()
                 position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
                 replace_node(mapping[position_ids].get_node(), position_ids_parameter[0])
+                print('INSERTED NEW PARAMETER: position_ids')
                 return True
 
             self.register_matcher(Matcher(add, "InputAndPoistionIDsAdd"), callback)
@@ -405,8 +439,8 @@ def patch_stateful_model(model):
     m = Manager()
     m.set_per_pass_validation(False)
     m.register_pass(StateManagementPattern())
+    m.register_pass(MaxSequenceLengthPattern())
     if 'position_ids' not in sum([list(t.get_names()) for t in model.inputs], []):
-        print('POSITION ID REPLACER REGISTERED')
         m.register_pass(PositionIDsReplacer())
     m.run_passes(model)
     model.remove_parameter(model.input('beam_idx').get_node())
@@ -416,6 +450,7 @@ def patch_stateful_model(model):
     model.add_parameters(model_remaining_params)
     for sink in assignes_to_remove:
         model.remove_sink(sink)
+    print('PARAMETERS ARE REORGANIZED, THE STATE IS REMOVED')
 
 class ModelRunner:
 
@@ -457,10 +492,10 @@ class ModelRunner:
 
     def load_model(self) -> None:
         if is_openvino_optimum_intel:
+            import openvino as ov
             from optimum.intel import OVModelForCausalLM
             self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, stateful=True) # need stateful because it also enables SDPA
             patch_stateful_model(self.model.model)
-            import openvino as ov
             ov.serialize(self.model.model, 'vllm_openvino_model.xml')
             core = ov.Core()
             ov_compiled = core.compile_model(self.model.model, "CPU")
@@ -499,6 +534,8 @@ class ModelRunner:
                     inputs.append(input_metadata.max_context_len)
                     inputs.append(input_metadata.context_lens)
                     inputs.append(input_metadata.block_tables)
+                else:
+                    inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
                 #for input in inputs:
                 #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
                 result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
