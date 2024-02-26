@@ -304,7 +304,7 @@ def patch_stateful_model(model):
     factory.add_extension("libuser_ov_extensions.so")
 
     #model.remove_parameter(model.input('beam_idx').get_node())
-    max_context_len = opset13.parameter(shape=[], dtype=np.int32)  # max_context_len
+    max_context_len = opset13.parameter(shape=[], dtype=np.int32, name='max_context_len')  # max_context_len
     model_remaining_params = [
         opset13.parameter(shape=[], dtype=bool),  # is_prompt
         opset13.parameter(shape=[-1, -1], dtype=np.int64),  # slot mapping
@@ -321,6 +321,8 @@ def patch_stateful_model(model):
 
     kv_parameters = []
     assignes_to_remove = []
+    parameters_to_remove = []
+    results_to_remove = []
     position_ids_parameter = []
 
     class StateManagementPattern(MatcherPass):
@@ -328,35 +330,34 @@ def patch_stateful_model(model):
             MatcherPass.__init__(self)
             self.model_changed = False
 
-            k_past = WrapType("opset13.ReadValue", AnyInput().output(0))
-            k_gather = WrapType("opset13.Gather", [k_past.output(0), AnyInput().output(0), AnyInput().output(0)])
+            k_past_var = WrapType("opset13.ReadValue", AnyInput())
+            k_past_par = WrapType("opset13.Parameter")
+            k_past = Or([WrapType("opset13.Gather", [k_past_var, AnyInput(), AnyInput()]), k_past_par])
             k_current = AnyInput()
-            k_concat = WrapType("opset13.Concat", [k_gather.output(0), k_current.output(0)])
-
-            def any_input():
-                return AnyInput().output(0)
+            k_concat = WrapType("opset13.Concat", [k_past, k_current])
 
             def kv_shaping(kv_concat):
-                interim = WrapType("opset13.StridedSlice", [kv_concat.output(0), *[any_input() for _ in range(3)]])
-                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
-                interim = WrapType("opset13.Unsqueeze", [interim.output(0), any_input()])
-                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
-                interim = WrapType("opset13.StridedSlice", [interim.output(0), *[any_input() for _ in range(3)]])
-                interim = WrapType("opset13.Broadcast", [interim.output(0), any_input()])
-                interim = WrapType("opset13.Reshape", [interim.output(0), any_input()])
+                interim = WrapType("opset13.StridedSlice", [kv_concat, *[AnyInput() for _ in range(3)]])
+                interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
+                interim = WrapType("opset13.Unsqueeze", [interim, AnyInput()])
+                interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
+                interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
+                interim = WrapType("opset13.Broadcast", [interim, AnyInput()])
+                interim = WrapType("opset13.Reshape", [interim, AnyInput()])
                 return interim
 
-            v_past = WrapType("opset13.ReadValue", AnyInput().output(0))
-            v_gather = WrapType("opset13.Gather", [v_past.output(0), AnyInput().output(0), AnyInput().output(0)])
+            v_past_var = WrapType("opset13.ReadValue", AnyInput())
+            v_past_par = WrapType("opset13.Parameter")
+            v_past = Or([WrapType("opset13.Gather", [v_past_var, AnyInput(), AnyInput()]), v_past_par])
             v_current = AnyInput()
-            v_concat = WrapType("opset13.Concat", [v_gather.output(0), v_current.output(0)])
+            v_concat = WrapType("opset13.Concat", [v_past, v_current])
 
             q = AnyInput()
             sdpa = WrapType("opset13.ScaledDotProductAttention", [
-                q.output(0),
-                Or([k_concat.output(0), kv_shaping(k_concat).output(0)]).output(0),
-                Or([v_concat.output(0), kv_shaping(v_concat).output(0)]).output(0),
-                AnyInput().output(0)
+                q,
+                Or([k_concat, kv_shaping(k_concat)]),
+                Or([v_concat, kv_shaping(v_concat)]),
+                AnyInput()
             ])
 
             def callback(m: Matcher) -> bool:
@@ -380,14 +381,31 @@ def patch_stateful_model(model):
                 pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, 64], True)  # FIXME: 64 is hardcoded, take ShapeOf instead
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
+                # def add_kv_parameter(past_node):
+                #     if past_node.get_type_info().name == 'Parameter':
+                #         parameters_to_remove.append(past_node)
+
+                # add_kv_parameter(mapping[k_gather])
+                # add_kv_parameter(mapping[v_gather])
+
+                if v_past_par in mapping:
+                    parameters_to_remove.append(mapping[v_past_par].get_node())
+
+                if k_past_par in mapping:
+                    parameters_to_remove.append(mapping[k_past_par].get_node())
+
                 def add_assign_consumers(output):
                     for consumer in output.get_target_inputs():
                         consumer_node = consumer.get_node()
-                        if consumer_node.get_type_info().name == 'Assign':
+                        consumer_type = consumer_node.get_type_info().name
+                        if consumer_type == 'Assign':  # stateful model
                             assignes_to_remove.append(consumer_node)
+                        elif consumer_type == 'Result':  # stateless model
+                            results_to_remove.append(consumer_node)
 
                 add_assign_consumers(mapping[k_concat])
                 add_assign_consumers(mapping[v_concat])
+
                 replace_node(m.get_match_root(), pa_transpose)
                 print('INSERTED PageAttentionExtension')
                 return True
@@ -399,10 +417,10 @@ def patch_stateful_model(model):
             MatcherPass.__init__(self)
             self.model_changed = False
 
-            kv_past = WrapType("opset13.ReadValue", AnyInput().output(0))
-            kv_gather = WrapType("opset13.Gather", [kv_past.output(0), AnyInput().output(0), AnyInput().output(0)])
-            kv_shape = WrapType("opset13.ShapeOf", [kv_gather.output(0)])
-            seq = WrapType("opset13.Gather", [kv_shape.output(0), AnyInput().output(0), AnyInput().output(0)])
+            kv_past = WrapType("opset13.ReadValue", AnyInput())
+            kv_gather = WrapType("opset13.Gather", [kv_past, AnyInput(), AnyInput()])
+            kv_shape = WrapType("opset13.ShapeOf", [kv_gather])
+            seq = WrapType("opset13.Gather", [kv_shape, AnyInput(), AnyInput()])
 
             def callback(m: Matcher) -> bool:
                 replace_node(m.get_match_root(), max_context_len)
@@ -417,19 +435,20 @@ def patch_stateful_model(model):
             self.model_changed = False
 
             input_ids = AnyInput()
-            input_embed = WrapType("opset13.Gather", [AnyInput().output(0), input_ids.output(0), AnyInput().output(0)])
+            input_embed = WrapType("opset13.Gather", [AnyInput(), input_ids, AnyInput()])
 
             position_ids = AnyInput()
             offset = WrapType('opset13.Constant')
             add_offset = WrapType('opset13.Add', [position_ids, offset])
             convert = WrapType('opset13.Convert', [add_offset])
-            position_embed = WrapType("opset13.Gather", [AnyInput().output(0), convert.output(0), AnyInput().output(0)])
+            position_embed = WrapType("opset13.Gather", [AnyInput(), convert, AnyInput()])
 
             add = WrapType("opset13.Add", [input_embed, position_embed])
 
             def callback(m: Matcher) -> bool:
                 mapping = m.get_pattern_value_map()
-                position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
+                if not position_ids_parameter:
+                    position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
                 replace_node(mapping[position_ids].get_node(), position_ids_parameter[0])
                 print('INSERTED NEW PARAMETER: position_ids')
                 return True
@@ -440,17 +459,34 @@ def patch_stateful_model(model):
     m.set_per_pass_validation(False)
     m.register_pass(StateManagementPattern())
     m.register_pass(MaxSequenceLengthPattern())
-    if 'position_ids' not in sum([list(t.get_names()) for t in model.inputs], []):
+
+    def has_parameter(model, name):
+        return name in sum([list(t.get_names()) for t in model.inputs], [])
+
+    if has_parameter(model, 'position_ids'):
+        position_ids_parameter.append(model.input('position_ids').get_node())
+    else:
         m.register_pass(PositionIDsReplacer())
+
     m.run_passes(model)
-    model.remove_parameter(model.input('beam_idx').get_node())
+
+    if has_parameter(model, 'beam_idx'):
+        model.remove_parameter(model.input('beam_idx').get_node())
     model.remove_parameter(model.input('attention_mask').get_node())
-    model.add_parameters(position_ids_parameter)
-    model.add_parameters(kv_parameters)
-    model.add_parameters(model_remaining_params)
+    print('parameters_to_remove:', parameters_to_remove)
+    print('results_to_remove:', results_to_remove)
+    print('sinks_to_remove:', assignes_to_remove)
+    for parameter in parameters_to_remove:
+        model.remove_parameter(parameter)
     for sink in assignes_to_remove:
         model.remove_sink(sink)
-    print('PARAMETERS ARE REORGANIZED, THE STATE IS REMOVED')
+    for result in results_to_remove:
+        model.remove_result(result)
+    if not has_parameter(model, 'position_ids'):
+        model.add_parameters(position_ids_parameter)
+    model.add_parameters(kv_parameters)
+    model.add_parameters(model_remaining_params)
+    print('PARAMETERS ARE REORGANIZED, THE STATE (IF EXISTS) IS REMOVED')
 
 class ModelRunner:
 
