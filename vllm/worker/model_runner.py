@@ -48,6 +48,47 @@ def flattenize_inputs(inputs):
     return flatten_inputs
 
 
+def ov_wrapper(self, *args, **kwargs):
+    #print('OV FORWARD WRAPPER')
+    #print(f'model class: {type(args[0])}')
+    #for i, input in enumerate(args[1:]):
+    #    print(f'[{i}]: {type(input)}')
+    #for key, value in kwargs.items():
+    #    print(f'{key}: {type(value)}')
+    #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
+    input_metadata = kwargs['input_metadata']
+    #print(dir(input_metadata))
+    #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
+    def prepare_data(t):
+        t = np.array(t, copy=False)
+        #print(t.__array_interface__['data'][0])
+        assert t.flags["C_CONTIGUOUS"]
+        return t
+    flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
+    #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
+    #print(f'kv-cache total size: {total_size}')
+    flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
+    inputs = [
+        kwargs['input_ids'],
+        kwargs['positions'],
+        *flatten_kv_cache,
+        input_metadata.is_prompt, input_metadata.slot_mapping
+    ]
+    #print('slot_mapping:', input_metadata.slot_mapping)
+    if input_metadata.max_context_len is not None:
+        # available from the second iteration
+        inputs.append(input_metadata.max_context_len)
+        inputs.append(input_metadata.context_lens)
+        inputs.append(input_metadata.block_tables)
+    else:
+        inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
+    #for input in inputs:
+    #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
+    result = self.ov_request.infer(inputs, share_inputs=True, share_outputs=False)
+    #print(f'result: {type(result)}')
+    return torch.from_numpy(result[0])
+
+
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
@@ -240,7 +281,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        #ov.save_model(ov_model, "vllm_openvino_model.xml")
+        #ov.serialize(ov_model, "vllm_openvino_model.xml")
         print('MODEL IS CONVERTED')
         #print(ov_model)
 
@@ -249,50 +290,11 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     ov_config = {ov.properties.enable_profiling: True}
     # ov_config = {}
     ov_compiled = core.compile_model(ov_model, "CPU", config=ov_config)
-    ov_request = ov_compiled.create_infer_request()
+    model.ov_request = ov_compiled.create_infer_request()
 
     from functools import partial
-    def wrapper(*args, **kwargs):
-        #print('OV FORWARD WRAPPER')
-        #print(f'model class: {type(args[0])}')
-        #for i, input in enumerate(args[1:]):
-        #    print(f'[{i}]: {type(input)}')
-        #for key, value in kwargs.items():
-        #    print(f'{key}: {type(value)}')
-        #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
-        input_metadata = kwargs['input_metadata']
-        #print(dir(input_metadata))
-        #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
-        def prepare_data(t):
-            t = np.array(t, copy=False)
-            #print(t.__array_interface__['data'][0])
-            assert t.flags["C_CONTIGUOUS"]
-            return t
-        flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
-        #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
-        #print(f'kv-cache total size: {total_size}')
-        flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
-        inputs = [
-            kwargs['input_ids'],
-            kwargs['positions'],
-            *flatten_kv_cache,
-            input_metadata.is_prompt, input_metadata.slot_mapping
-        ]
-        #print('slot_mapping:', input_metadata.slot_mapping)
-        if input_metadata.max_context_len is not None:
-            # available from the second iteration
-            inputs.append(input_metadata.max_context_len)
-            inputs.append(input_metadata.context_lens)
-            inputs.append(input_metadata.block_tables)
-        else:
-            inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
-        #for input in inputs:
-        #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-        result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
-        #print(f'result: {type(result)}')
-        return torch.from_numpy(result[0])
     model._openvino_patch_orig_forward = model.forward
-    model.forward = partial(wrapper, model)
+    model.forward = partial(ov_wrapper, model)
 
 
 def patch_stateful_model(model):
@@ -548,53 +550,14 @@ class ModelRunner:
             from optimum.intel import OVModelForCausalLM
             self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, load_in_8bit=False) # need stateful because it also enables SDPA
             patch_stateful_model(self.model.model)
-            ov.serialize(self.model.model, 'vllm_openvino_model.xml')
+            #ov.serialize(self.model.model, 'vllm_openvino_model.xml')
             core = ov.Core()
             ov_compiled = core.compile_model(self.model.model, "CPU")
-            ov_request = ov_compiled.create_infer_request()
+            self.model.ov_request = ov_compiled.create_infer_request()
 
             from functools import partial
-            def wrapper(*args, **kwargs):
-                #print('OV FORWARD WRAPPER')
-                #print(f'model class: {type(args[0])}')
-                #for i, input in enumerate(args[1:]):
-                #    print(f'[{i}]: {type(input)}')
-                #for key, value in kwargs.items():
-                #    print(f'{key}: {type(value)}')
-                #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
-                input_metadata = kwargs['input_metadata']
-                #print(dir(input_metadata))
-                #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
-                def prepare_data(t):
-                    t = np.array(t, copy=False)
-                    #print(t.__array_interface__['data'][0])
-                    assert t.flags["C_CONTIGUOUS"]
-                    return t
-                flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
-                #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
-                #print(f'kv-cache total size: {total_size}')
-                flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
-                inputs = [
-                    kwargs['input_ids'],
-                    kwargs['positions'],
-                    *flatten_kv_cache,
-                    input_metadata.is_prompt, input_metadata.slot_mapping
-                ]
-                #print('slot_mapping:', input_metadata.slot_mapping)
-                if input_metadata.max_context_len is not None:
-                    # available from the second iteration
-                    inputs.append(input_metadata.max_context_len)
-                    inputs.append(input_metadata.context_lens)
-                    inputs.append(input_metadata.block_tables)
-                else:
-                    inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
-                #for input in inputs:
-                #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-                result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
-                #print(f'result: {type(result)}')
-                return torch.from_numpy(result[0])
             self.model._openvino_patch_orig_forward = self.model.forward
-            self.model.forward = partial(wrapper, self.model)
+            self.model.forward = partial(ov_wrapper, self.model)
 
             # self.vllm_model = get_model(self.model_config)
             # def sample_wrapper(*args, **kwargs):
