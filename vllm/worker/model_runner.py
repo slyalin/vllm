@@ -548,7 +548,7 @@ class ModelRunner:
         if is_openvino_optimum_intel:
             import openvino as ov
             from optimum.intel import OVModelForCausalLM
-            self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, load_in_8bit=False) # need stateful because it also enables SDPA
+            self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
             patch_stateful_model(self.model.model)
             #ov.serialize(self.model.model, 'vllm_openvino_model.xml')
             core = ov.Core()
