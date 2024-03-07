@@ -296,14 +296,14 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     model._openvino_patch_orig_forward = model.forward
     model.forward = partial(ov_wrapper, model)
 
+from openvino.runtime.utils.node_factory import NodeFactory
+factory = NodeFactory()
 
 def patch_stateful_model(model):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
-    from openvino.runtime.utils.node_factory import NodeFactory
     from openvino.runtime.utils import replace_node
-    factory = NodeFactory()
     factory.add_extension("libuser_ov_extensions.so")
 
     #model.remove_parameter(model.input('beam_idx').get_node())
