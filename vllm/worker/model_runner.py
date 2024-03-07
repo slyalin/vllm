@@ -307,17 +307,19 @@ def patch_stateful_model(model):
     factory.add_extension("libuser_ov_extensions.so")
 
     #model.remove_parameter(model.input('beam_idx').get_node())
-    max_context_len = opset13.parameter(shape=[], dtype=np.int32, name='max_context_len')  # max_context_len
+    max_context_len = opset13.parameter(shape=[], dtype=np.int64, name='max_context_len')  # max_context_len
     model_remaining_params = [
         opset13.parameter(shape=[], dtype=bool, name='is_prompt'),  # is_prompt
         opset13.parameter(shape=[-1, -1], dtype=np.int64, name='slot_mapping'),  # slot mapping
         max_context_len,
-        opset13.parameter(shape=[-1], dtype=np.int32, name='context_lens'),  # context_lens
+        opset13.parameter(shape=[-1], dtype=np.int64, name='context_lens'),  # context_lens
         opset13.parameter(shape=[-1, -1], dtype=np.int32, name='block_tables'),  # block_tables
     ]
+    for parameter in model_remaining_params:
+        parameter.get_output_tensor(0).set_names({parameter.get_friendly_name()})
     paged_attention_remaining_args = [
-        opset13.constant([]),  # alibi_slopes
-        opset13.constant(0),  # sliding_window
+        opset13.constant(np.array([], np.float32)),  # alibi_slopes
+        opset13.constant(np.array(0, np.int32)),  # sliding_window
     ]
 
     kv_parameters = []
