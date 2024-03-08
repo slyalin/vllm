@@ -467,6 +467,7 @@ def patch_stateful_model(model, factory):
                     position_ids_parameter.append(opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids"))
                     print('CREATED A NEW position_ids PARAMETER')
                 replace_node(mapping[position_ids].get_node(), position_ids_parameter[0])
+                position_ids_parameter[0].get_output_tensor(0).set_names({'position_ids'})
                 print('APPLIED position_ids PARAMETER INSTEAD OF attention_mask-BASED SUB-GRAPH')
                 return True
 
@@ -574,11 +575,12 @@ class ModelRunner:
 
     def __del__(self):
         # Order is important
-        del self.model.ov_request
-        del self.model.model
-        if gc: # when app is being destroyed the module may not be available
-            gc.collect()
-        del self.model.ov_node_factory
+        if hasattr(self.model, 'ov_node_factory'):
+            del self.model.ov_request
+            del self.model.model
+            if gc: # when app is being destroyed the module may not be available
+                gc.collect()
+            del self.model.ov_node_factory
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
