@@ -550,10 +550,11 @@ class ModelRunner:
         if is_openvino_optimum_intel:
             import openvino as ov
             from optimum.intel import OVModelForCausalLM
+            core = ov.Core()
+            core.add_extension("libuser_ov_extensions.so")  # to keep library loaded and fix potential issue with NodeFactory early disposal
             self.model = OVModelForCausalLM.from_pretrained(self.model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
             patch_stateful_model(self.model.model)
             #ov.serialize(self.model.model, 'vllm_openvino_model.xml')
-            core = ov.Core()
             ov_compiled = core.compile_model(self.model.model, "CPU")
             self.model.ov_request = ov_compiled.create_infer_request()
 
