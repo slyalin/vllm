@@ -54,9 +54,34 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     return torch.from_numpy(outputs[0])
 
 
-def patch_stateful_model(
-    model: ov.Model,
-    factory):
+from openvino.runtime.op import util
+from openvino.runtime import Node
+
+class PagedAttentionExtension(util.Op):
+    class_type_info = ov.runtime.DiscreteTypeInfo("PagedAttentionExtension", "extension")
+    def __init__(self, inputs, holder):
+        super().__init__()
+        self.set_arguments(inputs)
+        self.validate()
+        self.holder = holder
+    def validate_and_infer_types(self):
+        self.set_output_type(0, self.get_input_element_type(0), self.get_input_partial_shape(0))
+    def clone_with_new_inputs(self, new_inputs):
+        node = PagedAttentionExtension(new_inputs, self.holder)
+        self.holder.append(node)
+        return node
+    def get_type_info(self):
+        return PagedAttentionExtension.class_type_info
+    def evaluate(self, outputs, inputs):
+        #FIXME: Stub
+        outputs[0] = inputs[0]
+        return True
+    def has_evaluate(self):
+        return True
+
+
+def patch_stateful_model(model: ov.Model):
+    model._nodes_holder = []
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -141,7 +166,7 @@ def patch_stateful_model(
                 v_reshape = opset13.reshape(v_transpose, opset13.constant([0, 0, -1]), True)
                 # TODO: Detect whether SDPA in the model graph has scale argument set and use it instead of the computed scale below
                 scale = opset13.constant(np.array(1.0/math.sqrt(float(hidden_dim)), dtype=np.float32))
-                paged_attention = factory.create("PagedAttentionExtension", [
+                paged_attention = PagedAttentionExtension([
                     q_reshape,
                     k_reshape,
                     v_reshape,
@@ -150,8 +175,11 @@ def patch_stateful_model(
                     *model_remaining_params,
                     scale,
                     *paged_attention_remaining_args
-                ])
+                ], model._nodes_holder)
+                model._nodes_holder.append(paged_attention)
+                print(paged_attention.get_type_info())
                 pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, hidden_dim], True)
+                print(pa_reshape.input_value(0).get_node().get_type_info())
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
                 # def add_kv_parameter(past_node):
@@ -438,12 +466,7 @@ def get_model(model_config: ModelConfig,
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
         pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
-        if not hasattr(pt_model, 'ov_node_factory'):
-            from openvino.runtime.utils.node_factory import NodeFactory
-            # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
-            pt_model.ov_node_factory = NodeFactory()
-            pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
-        patch_stateful_model(pt_model.model, pt_model.ov_node_factory)
+        patch_stateful_model(pt_model.model)
         core = ov.Core()
         ov_compiled = core.compile_model(pt_model.model, "CPU")
         pt_model._ov_request = ov_compiled.create_infer_request()
