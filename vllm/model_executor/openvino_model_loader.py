@@ -12,6 +12,7 @@ from vllm.sequence import SamplerOutput
 from vllm.utils import is_openvino_optimum_intel
 
 import openvino as ov
+from openvino import Type
 
 
 def _flattenize_inputs(inputs):
@@ -80,7 +81,7 @@ class PagedAttentionExtension(util.Op):
         return True
 
 
-def patch_stateful_model(model: ov.Model):
+def patch_stateful_model(model: ov.Model, kv_cache_dtype: Type):
     model._nodes_holder = []
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
@@ -153,8 +154,8 @@ def patch_stateful_model(model: ov.Model):
                 real_v = mapping[v_current]
                 hidden_shape = real_q.get_partial_shape()
                 hidden_dim = hidden_shape[hidden_shape.rank.get_length() - 1].get_length()  # TODO: What if it is a dynamic? Need to insert a ShapeOf sub-graph instead
-                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=np.float32)
-                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=np.float32)
+                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
+                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
                 # TODO: The rank 4 is used in the following code, but it is not guaranteed for all models, adopt to other ranks.
@@ -302,7 +303,8 @@ def patch_stateful_model(model: ov.Model):
 
 def _patch_model_with_openvino(
         pt_model: torch.nn.Module,
-        model_config: ModelConfig):
+        model_config: ModelConfig,
+        kv_cache_dtype: Type):
     print(' ============= PATCHING MODEL =============')
     from vllm.model_executor.layers.attention.attention import Attention
     from openvino.frontend.pytorch import ModuleExtension
@@ -322,7 +324,15 @@ def _patch_model_with_openvino(
 
     # Prepare example inputs
 
-    kv_cache_dtype = torch.float32
+    torch_dtype_maping = {
+        Type.boolean: torch.bool,
+        Type.f32: torch.float32,
+        Type.f16: torch.float16,
+        Type.bf16: torch.bfloat16,
+        Type.i32: torch.int32,
+        Type.i64: torch.int64
+    }
+    kv_cache_dtype = torch_dtype_maping[kv_cache_dtype]
     num_heads = pt_model.config.num_attention_heads
     num_kv_heads = num_heads
     head_size = pt_model.config.hidden_size // num_kv_heads
@@ -451,6 +461,7 @@ def ov_sample(
 
 def get_model(model_config: ModelConfig,
               device_config: DeviceConfig,
+              kv_cache_dtype: Type,
               **kwargs) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
     if lora_config:
@@ -466,7 +477,7 @@ def get_model(model_config: ModelConfig,
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
         pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
-        patch_stateful_model(pt_model.model)
+        patch_stateful_model(pt_model.model, kv_cache_dtype)
         core = ov.Core()
         ov_compiled = core.compile_model(pt_model.model, "CPU")
         pt_model._ov_request = ov_compiled.create_infer_request()
@@ -480,6 +491,6 @@ def get_model(model_config: ModelConfig,
     else:
         from vllm.model_executor.model_loader import get_model
         pt_model = get_model(model_config, device_config, **kwargs)
-        _patch_model_with_openvino(pt_model, model_config)
+        _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype)
 
     return pt_model
