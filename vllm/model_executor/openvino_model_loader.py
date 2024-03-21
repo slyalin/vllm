@@ -60,16 +60,14 @@ from openvino.runtime import Node
 
 class PagedAttentionExtension(util.Op):
     class_type_info = ov.runtime.DiscreteTypeInfo("PagedAttentionExtension", "extension")
-    def __init__(self, inputs, holder):
+    def __init__(self, inputs):
         super().__init__()
         self.set_arguments(inputs)
         self.validate()
-        self.holder = holder
-        self.holder.append(self)
     def validate_and_infer_types(self):
         self.set_output_type(0, self.get_input_element_type(0), self.get_input_partial_shape(0))
     def clone_with_new_inputs(self, new_inputs):
-        node = PagedAttentionExtension(new_inputs, self.holder)
+        node = PagedAttentionExtension(new_inputs)
         return node
     def get_type_info(self):
         return PagedAttentionExtension.class_type_info
@@ -83,7 +81,6 @@ class PagedAttentionExtension(util.Op):
 
 
 def patch_stateful_model(model: ov.Model, kv_cache_dtype: Type):
-    model._nodes_holder = []
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -177,7 +174,7 @@ def patch_stateful_model(model: ov.Model, kv_cache_dtype: Type):
                     *model_remaining_params,
                     scale,
                     *paged_attention_remaining_args
-                ], model._nodes_holder)
+                ])
                 pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, hidden_dim], True)
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
@@ -405,11 +402,10 @@ def _patch_model_with_openvino(
             torch.tensor(module.backend.sliding_window if module.backend.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
         )
 
-    pt_model._nodes_holder = []
     def paged_attention_convertion(context):
         # TODO: Extend Context API with a function that returns all inputs (if they can be enumerated by indices)
         inputs = [context.get_input(i) for i in range(context.get_input_size())]
-        pa = PagedAttentionExtension(inputs, pt_model._nodes_holder)
+        pa = PagedAttentionExtension(inputs)
         return pa.outputs()
 
     with torch.no_grad():
@@ -498,4 +494,5 @@ def get_model(model_config: ModelConfig,
         pt_model = get_model(model_config, device_config, **kwargs)
         _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype)
 
+    del PagedAttentionExtension.class_type_info
     return pt_model
