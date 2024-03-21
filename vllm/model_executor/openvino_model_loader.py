@@ -65,11 +65,11 @@ class PagedAttentionExtension(util.Op):
         self.set_arguments(inputs)
         self.validate()
         self.holder = holder
+        self.holder.append(self)
     def validate_and_infer_types(self):
         self.set_output_type(0, self.get_input_element_type(0), self.get_input_partial_shape(0))
     def clone_with_new_inputs(self, new_inputs):
         node = PagedAttentionExtension(new_inputs, self.holder)
-        self.holder.append(node)
         return node
     def get_type_info(self):
         return PagedAttentionExtension.class_type_info
@@ -178,10 +178,7 @@ def patch_stateful_model(model: ov.Model, kv_cache_dtype: Type):
                     scale,
                     *paged_attention_remaining_args
                 ], model._nodes_holder)
-                model._nodes_holder.append(paged_attention)
-                print(paged_attention.get_type_info())
                 pa_reshape = opset13.reshape(paged_attention, [0, 0, -1, hidden_dim], True)
-                print(pa_reshape.input_value(0).get_node().get_type_info())
                 pa_transpose = opset13.transpose(pa_reshape, opset13.constant([0, 2, 1, 3]))
 
                 # def add_kv_parameter(past_node):
@@ -308,7 +305,7 @@ def _patch_model_with_openvino(
         kv_cache_dtype: Type):
     print(' ============= PATCHING MODEL =============')
     from vllm.model_executor.layers.attention.attention import Attention
-    from openvino.frontend.pytorch import ModuleExtension
+    from openvino.frontend.pytorch import ModuleExtension, ConversionExtension
     from openvino import Core, convert_model, Type, PartialShape
 
     # Avoid usage of vllm._C.ops
@@ -408,6 +405,13 @@ def _patch_model_with_openvino(
             torch.tensor(module.backend.sliding_window if module.backend.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
         )
 
+    pt_model._nodes_holder = []
+    def paged_attention_convertion(context):
+        # TODO: Extend Context API with a function that returns all inputs (if they can be enumerated by indices)
+        inputs = [context.get_input(i) for i in range(context.get_input_size())]
+        pa = PagedAttentionExtension(inputs, pt_model._nodes_holder)
+        return pa.outputs()
+
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
         ov_model =  convert_model(
@@ -420,7 +424,7 @@ def _patch_model_with_openvino(
                     evaluate=lambda module, *args, **kwargs: args[0],  # need this because PagedAttention module fails in torch.jit.trace
                     convert=wrapper
                 ),
-                "libuser_ov_extensions.so"
+                ConversionExtension('PagedAttentionExtension', paged_attention_convertion)
             ]
         )
 
@@ -480,7 +484,9 @@ def get_model(model_config: ModelConfig,
         pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
         patch_stateful_model(pt_model.model, kv_cache_dtype)
         core = ov.Core()
+        print('COMPILE')
         ov_compiled = core.compile_model(pt_model.model, "CPU")
+        print('END COMPILE')
         pt_model._ov_request = ov_compiled.create_infer_request()
 
         pt_model._openvino_patch_orig_forward = pt_model.forward
