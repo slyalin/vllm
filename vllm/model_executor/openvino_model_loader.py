@@ -494,5 +494,4 @@ def get_model(model_config: ModelConfig,
         pt_model = get_model(model_config, device_config, **kwargs)
         _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype)
 
-    del PagedAttentionExtension.class_type_info
     return pt_model
