@@ -135,6 +135,9 @@ def is_openvino() -> bool:
     return is_openvino_available
 
 def is_openvino_optimum_intel() -> bool:
+    if os.getenv('VLLM_OPENVINO_OPTIMUM', "1") == "0":
+        # The environment variable can only disable optimum
+        return False
     is_optimum_intel_available = is_openvino()
     try:
         import optimum.intel

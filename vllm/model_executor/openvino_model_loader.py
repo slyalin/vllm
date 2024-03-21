@@ -75,6 +75,7 @@ class PagedAttentionExtension(util.Op):
         return PagedAttentionExtension.class_type_info
     def evaluate(self, outputs, inputs):
         #FIXME: Stub
+        print(inputs[0].data.shape)
         outputs[0] = inputs[0]
         return True
     def has_evaluate(self):
