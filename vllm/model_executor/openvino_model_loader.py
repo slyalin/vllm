@@ -484,9 +484,7 @@ def get_model(model_config: ModelConfig,
         pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
         patch_stateful_model(pt_model.model, kv_cache_dtype)
         core = ov.Core()
-        print('COMPILE')
         ov_compiled = core.compile_model(pt_model.model, "CPU")
-        print('END COMPILE')
         pt_model._ov_request = ov_compiled.create_infer_request()
 
         pt_model._openvino_patch_orig_forward = pt_model.forward
