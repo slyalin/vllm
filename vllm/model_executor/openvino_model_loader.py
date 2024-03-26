@@ -476,7 +476,7 @@ def get_model(model_config: ModelConfig,
             print(f'[ INFO ] Provided model id {model_config.model} does not contain OpenVINO IR, the model will be converted to IR with default options. '
                   'If you need to use specific options for model conversion, use optimum-cli export openvino with desired options.')
         else:
-            print(f'[ INFO ] OpenVINO IR is avaialble for provided model id {model_config.model}. '
+            print(f'[ INFO ] OpenVINO IR is available for provided model id {model_config.model}. '
                   'This IR will be used for inference as-is, all possible options that may affect model conversion are ignored.')
         pt_model = OVModelForCausalLM.from_pretrained(
             model_config.model,
