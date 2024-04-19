@@ -70,6 +70,12 @@ def patch_stateful_model(
     model: ov.Model,
     kv_cache_dtype: Type,
     is_cpu: bool):
+    if False:
+        from openvino._offline_transformations import paged_attention_transformation
+        paged_attention_transformation(model)
+        # TODO: Apply shapes depending on is_cpu and kv cache type here.
+        # TODO: Consider eliminating those adjustments later
+        return
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
