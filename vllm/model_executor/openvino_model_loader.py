@@ -66,36 +66,31 @@ def arguments_as_outputs(arguments):
             outputs.extend(argument.outputs())
     return outputs
 
-def patch_stateful_model(
-    model: ov.Model,
-    kv_cache_dtype: Type,
-    is_cpu: bool):
-    if False:
-        from openvino._offline_transformations import paged_attention_transformation
-        paged_attention_transformation(model)
-        # TODO: Apply shapes depending on is_cpu and kv cache type here.
-        # TODO: Consider eliminating those adjustments later
-        return
+def set_name(node, name):
+    # Set name for both node and output tensor (should be only one tensor, and any other names will be overriden by a given single name)
+    node.set_friendly_name(name)
+    assert node.get_output_size() == 1
+    node.get_output_tensor(0).set_names({name})
+    return node
+
+def paged_attention_transformation(model: ov.Model):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
     from openvino.runtime.utils import replace_node
 
     #model.remove_parameter(model.input('beam_idx').get_node())
-    max_context_len = opset13.parameter(shape=[], dtype=np.int64, name='max_context_len')  # max_context_len
+    max_context_len = set_name(opset13.parameter(shape=[], dtype=np.int64), name='max_context_len')  # max_context_len
     model_remaining_params = [
-        opset13.parameter(shape=[], dtype=bool, name='is_prompt'),  # is_prompt
-        opset13.parameter(shape=[-1, -1], dtype=np.int64, name='slot_mapping'),  # slot mapping
+        set_name(opset13.parameter(shape=[], dtype=bool), name='is_prompt'),  # is_prompt
+        set_name(opset13.parameter(shape=[-1, -1], dtype=np.int64), name='slot_mapping'),  # slot mapping
         max_context_len,
-        opset13.parameter(shape=[-1], dtype=np.int64, name='context_lens'),  # context_lens
-        opset13.parameter(shape=[-1, -1], dtype=np.int32, name='block_tables'),  # block_tables
+        set_name(opset13.parameter(shape=[-1], dtype=np.int64), name='context_lens'),  # context_lens
+        set_name(opset13.parameter(shape=[-1, -1], dtype=np.int32), name='block_tables'),  # block_tables
     ]
-    for parameter in model_remaining_params:
-        parameter.get_output_tensor(0).set_names({parameter.get_friendly_name()})
     sliding_window = opset13.constant(np.array(0, np.int32))  # sliding_window
 
     current_seq_len = opset13.gather(opset13.shape_of(model.input('input_ids')), opset13.constant(1), opset13.constant(0))
-    current_seq_len.set_friendly_name('my_current_seq_len')
     prev_max_seq_len = max_context_len - current_seq_len
 
     def has_parameter(model, name):
@@ -106,8 +101,7 @@ def patch_stateful_model(
     parameters_to_remove = []
     results_to_remove = []  # used, but cannot really track all Results in stateless model
     if not has_parameter(model, 'position_ids'):
-        position_ids = opset13.parameter(shape=[-1, -1], dtype=np.int64, name="position_ids")
-        position_ids.get_output_tensor(0).set_names({position_ids.get_friendly_name()})
+        position_ids = set_name(opset13.parameter(shape=[-1, -1], dtype=np.int64), name="position_ids")
         model.add_parameters([position_ids])
         print('CREATED A NEW position_ids PARAMETER')
     position_ids = model.input('position_ids')
@@ -127,6 +121,8 @@ def patch_stateful_model(
             k_current2 = AnyInput()
             k_current_reshaped = WrapType("opset13.Reshape", [k_current2, AnyInput()])
             k_concat = WrapType("opset13.Concat", [k_past, Or([k_current_reshaped, k_current])])
+
+            self.layer_index = 0  # to generate names for key and value cache inputs
 
             def kv_shaping(kv_concat):
                 interim = WrapType("opset13.StridedSlice", [kv_concat, *[AnyInput() for _ in range(3)]])
@@ -193,11 +189,11 @@ def patch_stateful_model(
 
                 real_k = take_4d(k_current, k_current_reshaped, k_current2)
                 real_v = take_4d(v_current, v_current_reshaped, v_current2)
-                if is_cpu:
-                    k_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
-                else:
-                    k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
-                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
+                kv_cache_type = real_q.get_element_type()
+                layer_index_str = str(self.layer_index)
+                k_parameter = set_name(opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_type), name='key_cache.' + layer_index_str)
+                v_parameter = set_name(opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_type), name='value_cache.' + layer_index_str)
+                self.layer_index += 1
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
                 q_transpose = opset13.transpose(real_q, kv_transpose_order)
@@ -389,6 +385,40 @@ def patch_stateful_model(
     model.add_parameters(kv_parameters)
     model.add_parameters(model_remaining_params)
     print('PARAMETERS ARE REORGANIZED, THE STATE (IF EXISTS) IS REMOVED')
+
+def modify_cache_parameters(
+        model: ov.Model,
+        kv_cache_dtype: ov.Type,
+        is_cpu: bool
+):
+    # Apply hardware dependent modifications to KV tensors
+    for parameter in model.get_parameters():
+        input = parameter.get_output_tensor(0)
+        input_names = input.get_names()
+        if len(input_names) != 1:
+            continue
+        input_name = next(iter(input_names))
+        if input_name.startswith('key_cache.'):
+            if is_cpu:
+                parameter.set_partial_shape(ov.PartialShape([-1, -1, -1, -1]))
+        elif not input_name.startswith('value_cache.'):
+            continue
+        parameter.set_element_type(kv_cache_dtype)
+    model.validate_nodes_and_infer_types()
+
+
+def patch_stateful_model(
+    model: ov.Model,
+    kv_cache_dtype: Type,
+    is_cpu: bool):
+    transformation_in_openvino = False
+    if transformation_in_openvino:
+        from openvino._offline_transformations import paged_attention_transformation as transformation
+        transformation(model)
+    else:
+        paged_attention_transformation(model)
+    modify_cache_parameters(model, kv_cache_dtype, is_cpu)
+
 
 def _patch_model_with_openvino(
         pt_model: torch.nn.Module,
@@ -585,7 +615,7 @@ def require_model_export(model_id, revision=None, subfolder=None):
 
 def get_model(model_config: ModelConfig,
               device_config: DeviceConfig,
-              kv_cache_dtype: Type,
+              kv_cache_dtype: ov.Type,
               **kwargs) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
     if lora_config:
