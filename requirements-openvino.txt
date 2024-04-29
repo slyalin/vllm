@@ -1,17 +1,11 @@
-sentencepiece  # Required for LLaMA tokenizer.
-numpy
-fastapi
-psutil
-uvicorn[standard]
-pydantic >= 2.0  # Required for OpenAI server.
-prometheus_client >= 0.18.0
+# Common dependencies
+-r requirements-common.txt
+
+# OpenVINO dependencies
 torch >= 2.1.2
-transformers >= 4.38.0  # Required for Gemma.
 openvino >= 2024.1.0
 optimum-intel[openvino] >= 1.16.1
-outlines >= 0.0.27
 einops
 ai2-olmo # hf_olmo
-tiktoken
 transformers_stream_generator
 bitsandbytes

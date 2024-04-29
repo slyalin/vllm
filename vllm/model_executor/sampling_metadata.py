@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from vllm.model_executor.layers.ops.sample import get_num_triton_sampler_splits
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SequenceData, SequenceGroupMetadata
 from vllm.utils import (async_tensor_h2d, is_pin_memory_available,
@@ -327,6 +326,7 @@ class SamplingTensors:
         do_min_p = False
 
         # We need one base seed per Triton slice.
+        from vllm.model_executor.layers.ops.sample import get_num_triton_sampler_splits
         seeds_to_generate = (extra_seeds_to_generate +
                              get_num_triton_sampler_splits(vocab_size))
 
