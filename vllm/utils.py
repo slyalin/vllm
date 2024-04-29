@@ -31,6 +31,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float": torch.float,
     "fp8": torch.uint8,
+    "u8": torch.uint8
 }
 
 
@@ -131,6 +132,26 @@ def is_cpu() -> bool:
         return "cpu" in version("vllm")
     except PackageNotFoundError:
         return False
+
+
+@lru_cache(maxsize=None)
+def is_openvino() -> bool:
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return "openvino" in version("vllm")
+    except PackageNotFoundError:
+        return False
+
+
+def is_openvino_optimum_intel() -> bool:
+    if os.environ.get('VLLM_OPENVINO_OPTIMUM', '1') == '0':
+        return False
+    is_optimum_intel_available = is_openvino()
+    try:
+        import optimum.intel
+    except:
+        is_optimum_intel_available = False
+    return is_optimum_intel_available
 
 
 @lru_cache(maxsize=None)
@@ -439,6 +460,8 @@ def is_pin_memory_available() -> bool:
         print_warning_once("Pin memory is not supported on Neuron.")
         return False
     elif is_cpu():
+        return False
+    elif is_openvino():
         return False
     return True
 
