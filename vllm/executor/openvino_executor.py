@@ -11,14 +11,17 @@ from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         make_async)
 
+import openvino as ov
+import openvino.properties.hint as hints
+
 logger = init_logger(__name__)
 
 
 class OpenVINOExecutor(ExecutorBase):
 
     def _init_executor(self) -> None:
-        assert self.device_config.device_type == "cpu"
-        assert self.lora_config is None, "cpu backend doesn't support LoRA"
+        assert self.device_config.device_type == "openvino"
+        assert self.lora_config is None, "OpenVINO backend doesn't support LoRA"
         self.model_config = _verify_and_get_model_config(self.model_config)
         self.cache_config = _verify_and_get_cache_config(self.cache_config)
         self.scheduler_config = _verify_and_get_scheduler_config(
@@ -28,14 +31,14 @@ class OpenVINOExecutor(ExecutorBase):
         self._init_worker()
 
     def _init_worker(self):
-        from vllm.worker.cpu_worker import CPUWorker
+        from vllm.worker.openvino_worker import OpenVINOWorker
 
         assert self.parallel_config.world_size == 1, (
-            "CPUExecutor only supports single CPU socket currently.")
+            "OpenVINOExecutor only supports single OpenVINO socket currently.")
 
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
-        self.driver_worker = CPUWorker(
+        self.driver_worker = OpenVINOWorker(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
@@ -66,7 +69,7 @@ class OpenVINOExecutor(ExecutorBase):
         # NOTE: We log here to avoid multiple logs when number of workers is
         # greater than one. We could log in the engine, but not all executors
         # have GPUs.
-        # NOTE: `cpu block` for CPU backend is located on CPU memory but is
+        # NOTE: `cpu block` for OpenVINO backend is located on CPU memory but is
         # referred as `gpu block`. Because we want to reuse the existing block
         # management procedure.
         logger.info("# CPU blocks: %d", num_gpu_blocks)
@@ -96,12 +99,12 @@ class OpenVINOExecutor(ExecutorBase):
         return self.driver_worker.list_loras()
 
     def check_health(self) -> None:
-        # CPUExecutor will always be healthy as long as
+        # OpenVINOExecutor will always be healthy as long as
         # it's running.
         return
 
 
-class CPUExecutorAsync(CPUExecutor, ExecutorAsyncBase):
+class OpenVINOExecutorAsync(CPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
         self,
@@ -118,15 +121,15 @@ class CPUExecutorAsync(CPUExecutor, ExecutorAsyncBase):
         return output
 
     async def check_health_async(self) -> None:
-        # CPUExecutor will always be healthy as long as
+        # OpenVINOExecutor will always be healthy as long as
         # it's running.
         return
 
 
 def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
-    if config.dtype == torch.float16:
-        logger.warning("float16 is not supported on CPU, casting to bfloat16.")
-        config.dtype = torch.bfloat16
+    if config.dtype != torch.float32:
+        logger.warning(f"Only float32 dtype is supported on OpenVINO, casting from {config.dtype}.")
+        config.dtype = torch.float32
     if not config.enforce_eager:
         logger.warning(
             "CUDA graph is not supported on CPU, fallback to the eager "
@@ -138,7 +141,7 @@ def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
 def _verify_and_get_scheduler_config(
         config: SchedulerConfig) -> SchedulerConfig:
     if config.chunked_prefill_enabled:
-        logger.warning("Chunked prefill is not supported on CPU, disable it.")
+        logger.warning("Chunked prefill is not supported on OpenVINO backend, disable it.")
         config.chunked_prefill_enabled = False
 
     return config
@@ -147,22 +150,33 @@ def _verify_and_get_scheduler_config(
 def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
     _GB = 1 << 30
     if config.enable_prefix_caching:
-        logger.warning("Prefix caching is not supported on CPU, disable it.")
+        logger.warning("Prefix caching is not supported on OpenVINO backend, disable it.")
         config.enable_prefix_caching = False
 
-    kv_cache_space_str = os.getenv("VLLM_CPU_KVCACHE_SPACE", "0")
+    if os.environ.get("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", "") == "u8":
+        logger.warning("KV cache type is overried to u8 via VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
+        cache_config.cache_dtype = "u8"
+    else:
+        core = ov.Core()
+        inference_precision = core.get_property("CPU", hints.inference_precision)
+        if inference_precision == ov.Type.bf16:
+            cache_config.cache_dtype = torch.bfloat16
+        else:
+            cache_config.cache_dtype = torch.float16
+
+    kv_cache_space_str = os.getenv("VLLM_OPENVINO_KVCACHE_SPACE", "0")
     kv_cache_space = int(kv_cache_space_str)
 
     if kv_cache_space >= 0:
         if kv_cache_space == 0:
-            config.cpu_kvcache_space_bytes = 4 * _GB  # type: ignore
-            logger.warning("Environment variable VLLM_CPU_KVCACHE_SPACE (GB) "
-                           "for CPU backend is not set, using 4 by default.")
+            config.openvino_kvcache_space_bytes = 4 * _GB  # type: ignore
+            logger.warning("Environment variable VLLM_OPENVINO_KVCACHE_SPACE (GB) "
+                           "for OpenVINO backend is not set, using 4 by default.")
         else:
-            config.cpu_kvcache_space_bytes = kv_cache_space * _GB  # type: ignore
+            config.openvino_kvcache_space_bytes = kv_cache_space * _GB  # type: ignore
     else:
         raise RuntimeError(
-            "Invalid environment variable VLLM_CPU_KVCACHE_SPACE"
+            "Invalid environment variable VLLM_OPENVINO_KVCACHE_SPACE"
             f" {kv_cache_space}, expect a positive integer value.")
 
     return config

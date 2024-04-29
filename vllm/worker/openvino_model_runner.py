@@ -9,7 +9,7 @@ from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
 from vllm.distributed import broadcast_tensor_dict
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
-from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.openvino import get_model
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.utils import make_tensor_with_pad
 
@@ -18,7 +18,7 @@ logger = init_logger(__name__)
 _PAD_SLOT_ID = -1
 
 
-class CPUModelRunner:
+class OpenVINOModelRunner:
 
     def __init__(
         self,
@@ -64,12 +64,7 @@ class CPUModelRunner:
     def load_model(self) -> None:
         self.model = get_model(
             model_config=self.model_config,
-            load_config=self.load_config,
-            device_config=self.device_config,
-            vision_language_config=self.vision_language_config,
-            lora_config=self.lora_config,
-            parallel_config=self.parallel_config,
-            scheduler_config=self.scheduler_config)
+            device_config=self.device_config)
 
     def _prepare_prompt(
         self,

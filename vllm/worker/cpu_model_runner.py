@@ -37,7 +37,7 @@ class OpenVINOModelRunner:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
-        # Currently, CPU worker doesn't support chunked prefill.
+        # Currently, OpenVINO worker doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config

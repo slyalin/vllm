@@ -21,8 +21,8 @@ from vllm.worker.worker_base import LoraNotSupportedWorkerBase
 logger = init_logger(__name__)
 
 
-class CPUCacheEngine:
-    """Manages the KV cache for CPU backend.
+class OpenVINOCacheEngine:
+    """Manages the KV cache for OpenVINO backend.
 
     This class is responsible for initializing and managing CPU KV
     caches. It also provides methods for performing KV cache operations, such
@@ -32,7 +32,7 @@ class CPUCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig,
                  parallel_config: ParallelConfig,
                  device_config: DeviceConfig) -> None:
-        assert device_config.device_type == "cpu"
+        assert device_config.device_type == "openvino"
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -43,7 +43,7 @@ class CPUCacheEngine:
 
         self.block_size = cache_config.block_size
         # Note: In CacheConfig, num_gpu_blocks actual is num_cpu_blocks
-        # for CPU backend, because we want to reuse KV cache management
+        # for OpenVINO backend, because we want to reuse KV cache management
         # in the scheduler.
         self.num_cpu_blocks = cache_config.num_gpu_blocks
 
@@ -52,33 +52,41 @@ class CPUCacheEngine:
         else:
             self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
-        # Get attention backend.
-        self.attn_backend = get_attn_backend(model_config.dtype)
-
         # Initialize the cache.
-        self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks)
+        self.kv_cache = self._allocate_kv_cache(self.num_cpu_blocks)
+
+    def _get_key_block_shape(self) -> Tuple[int, int, int, int]:
+        return (self.num_heads, self.block_size, self.head_size)
+
+    def _get_value_block_shape(self) -> Tuple[int, int, int]:
+        return (self.num_heads, self.block_size, self.head_size)
 
     def _allocate_kv_cache(
         self,
         num_blocks: int,
     ) -> List[torch.Tensor]:
-        """Allocates KV cache on CPU."""
-        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_heads, self.head_size)
-        kv_cache: List[torch.Tensor] = []
+        """Allocates KV cache."""
+        key_block_shape = (self.num_cpu_blocks, *self._get_key_block_shape())
+        value_block_shape = (self.num_cpu_blocks, *self._get_value_block_shape())
+        kv_cache: List[ov.Tensor] = []
         for _ in range(self.num_layers):
-            kv_cache.append(
-                torch.empty(kv_cache_shape, dtype=self.dtype, device="cpu"))
+            key_blocks = ov.Tensor(self.cache_dtype, key_block_shape)
+            value_blocks = ov.Tensor(self.cache_dtype, value_block_shape)
+            kv_cache.append((key_blocks, value_blocks))
         return kv_cache
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
-        raise NotImplementedError("Swap is not supported in CPUCacheEngine.")
+        raise NotImplementedError("Swap is not supported in OpenVINOCacheEngine.")
 
     def swap_out(self, src_to_dst: Dict[int, int]) -> None:
-        raise NotImplementedError("Swap is not supported in CPUCacheEngine.")
+        raise NotImplementedError("Swap is not supported in OpenVINOCacheEngine.")
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        self.attn_backend.copy_blocks(self.cpu_cache, src_to_dsts)
+        for src, dsts in src_to_dsts.items():
+            for dst in dsts:
+                for key_cache, value_cache in self.kv_cache:
+                    key_cache.data[dst, :] = key_cache.data[src, :]
+                    value_cache.data[dst, :] = value_cache.data[src, :]
 
     @staticmethod
     def get_cache_block_size(
@@ -91,6 +99,12 @@ class CPUCacheEngine:
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
 
+        if cache_dtype == "u8":
+            # Scale, zero point and quantized data will be stored together.
+            # The layout for per token per head:
+            # |scale(f32)|zeropoint(f32)|quantized data(u8,idx_1)|quantized data(u8,idx_2)|...|quantized data(u8,idx_head_size)|
+            head_size += 8
+
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
@@ -102,13 +116,12 @@ class CPUCacheEngine:
         return dtype_size * total
 
 
-class CPUWorker(LoraNotSupportedWorkerBase):
-    """A worker class that executes (a partition of) the model on a CPU socket.
+class OpenVINOWorker(LoraNotSupportedWorkerBase):
+    """A worker class that executes the model on OpenVINO backend.
 
-    Each worker is associated with a single CPU socket. The worker is 
+    Each worker is associated with a single OpenVINO device. The worker is 
     responsible for maintaining the KV cache and executing the model on the 
-    CPU. In case of distributed inference, each worker is assigned a partition
-    of the model.
+    OpenVINO backend.
     """
 
     def __init__(
@@ -146,7 +159,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
-        self.model_runner = CPUModelRunner(
+        self.model_runner = OpenVINOModelRunner(
             model_config,
             parallel_config,
             scheduler_config,
@@ -158,8 +171,8 @@ class CPUWorker(LoraNotSupportedWorkerBase):
             is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
-        self.cache_engine: CPUCacheEngine
-        self.cpu_cache: List[torch.Tensor]
+        self.cache_engine: OpenVINOCacheEngine
+        self.kv_cache: List[torch.Tensor]
 
     def init_device(self) -> None:
         self.init_distributed_environment()
@@ -172,7 +185,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of blocks available for the KV cache.
 
-        This determines how many KV blocks can fit into the configured CPU
+        This determines how many KV blocks can fit into the configured
         KV cache space.
 
         Note that since vLLM assumes a block resides on GPU if it can be
@@ -180,10 +193,10 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         This allows us to reuse the scheduler of vLLM without generalizing it
         to different devices.
         """
-        # For CPU device, the block number will be calculated based on the
-        # cpu_kvcache_space.
+        # For OpenVINO backend, the block number will be calculated based on the
+        # openvino_kvcache_space_bytes.
         cache_block_size = self.get_cache_block_size_bytes()
-        num_cpu_blocks = int(self.cache_config.cpu_kvcache_space_bytes //
+        num_cpu_blocks = int(self.cache_config.openvino_kvcache_space_bytes //
                              cache_block_size)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
@@ -220,7 +233,7 @@ class CPUWorker(LoraNotSupportedWorkerBase):
         """
         if num_cpu_blocks <= 0:
             raise ValueError("No available memory for the cache blocks. "
-                             "Try increasing `VLLM_CPU_KVCACHE_SPACE` when "
+                             "Try increasing `VLLM_OPENVINO_KVCACHE_SPACE` when "
                              "initializing the engine.")
 
         max_seq_len = self.cache_config.block_size * num_cpu_blocks
@@ -229,22 +242,23 @@ class CPUWorker(LoraNotSupportedWorkerBase):
                 f"The model's max seq len ({self.model_config.max_model_len}) "
                 "is larger than the maximum number of tokens that can be "
                 f"stored in KV cache ({max_seq_len}). Try increasing "
-                "`VLLM_CPU_KVCACHE_SPACE` or decreasing `max_model_len` when "
+                "`VLLM_OPENVINO_KVCACHE_SPACE` or decreasing `max_model_len` when "
                 "initializing the engine.")
 
     def _init_cache_engine(self) -> None:
-        self.cache_engine = CPUCacheEngine(self.cache_config,
-                                           self.model_config,
-                                           self.parallel_config,
-                                           self.device_config)
-        self.cpu_cache = self.cache_engine.cpu_cache
+        self.cache_engine = OpenVINOCacheEngine(self.cache_config,
+                                                self.model_config,
+                                                self.parallel_config,
+                                                self.device_config)
+        self.kv_cache = self.cache_engine.kv_cache
         self.model_runner.block_size = self.cache_engine.block_size
 
-        assert self.cpu_cache is not None
+        assert self.kv_cache is not None
 
         # Populate the cache to warmup the memory
-        for layer_cache in self.cpu_cache:
-            layer_cache.fill_(0)
+        for key_cache, value_cache in self.kv_cache:
+            key_cache.data[dst, :] = key_cache.data[src, :]
+            value_cache.data[dst, :] = value_cache.data[src, :]
 
     def cache_copy(
         self,
@@ -287,9 +301,9 @@ class CPUWorker(LoraNotSupportedWorkerBase):
             return []
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.cpu_cache)
+                                                 self.kv_cache)
 
-        # CPU worker only supports single-step execution.
+        # OpenVINO worker only supports single-step execution.
         return [output]
 
     def init_distributed_environment(self) -> None:
@@ -315,6 +329,6 @@ class CPUWorker(LoraNotSupportedWorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Return the size in bytes of a single KV cache block.
         """
-        return CPUCacheEngine.get_cache_block_size(
+        return OpenVINOCacheEngine.get_cache_block_size(
             self.cache_config.block_size, self.cache_config.cache_dtype,
             self.model_config, self.parallel_config)
