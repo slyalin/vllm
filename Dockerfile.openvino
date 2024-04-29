@@ -1,0 +1,42 @@
+# The vLLM Dockerfile is used to construct vLLM image that can be directly used
+# to run the OpenAI compatible server.
+
+#################### BASE BUILD IMAGE ####################
+FROM ubuntu:22.04 AS dev
+
+RUN apt-get update -y && \
+    apt-get install -y python3-pip git
+WORKDIR /workspace
+
+# Install OpenVINO and OpenVINO Tokenizers
+RUN PIP_PRE=1 PIP_EXTRA_INDEX_URL="https://storage.openvinotoolkit.org/simple/wheels/nightly" python3 -m pip install openvino openvino-tokenizers
+#################### BASE BUILD IMAGE ####################
+
+
+#################### EXTENSION BUILD IMAGE ####################
+FROM dev AS build
+
+COPY requirements-build.txt /workspace/vllm/
+COPY requirements-openvino.txt /workspace/vllm/
+
+# install build dependencies
+RUN PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" python3 -m pip install -r /workspace/vllm/requirements-build.txt
+# install runtime dependencies
+RUN PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" python3 -m pip install -r /workspace/vllm/requirements-openvino.txt
+
+COPY vllm/ /workspace/vllm/vllm
+COPY setup.py /workspace/vllm/
+
+RUN python3 -m pip install --no-build-isolation /workspace/vllm/
+#################### EXTENSION Build IMAGE ####################
+
+
+#################### OPENAI API SERVER ####################
+# openai api server alternative
+FROM build AS vllm-openai
+# install additional dependencies for openai api server
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install accelerate
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+#################### OPENAI API SERVER ####################

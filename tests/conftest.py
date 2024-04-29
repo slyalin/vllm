@@ -150,14 +150,14 @@ class HfRunner:
                 model_name,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
-            ).cuda()
+            )
             self.processor = None
         else:
             self.model = _VISION_LANGUAGE_MODELS[model_name].from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
-            ).cuda()
+            )
             self.processor = AutoProcessor.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
@@ -179,14 +179,14 @@ class HfRunner:
             if self.model_name not in _VISION_LANGUAGE_MODELS:
                 input_ids = self.tokenizer(prompt,
                                            return_tensors="pt").input_ids
-                inputs = {"input_ids": input_ids.cuda()}
+                inputs = {"input_ids": input_ids}
             else:
                 image = images[i] if images else None
                 inputs = self.processor(text=prompt,
                                         images=image,
                                         return_tensors="pt")
                 inputs = {
-                    key: value.cuda() if value is not None else None
+                    key: value if value is not None else None
                     for key, value in inputs.items()
                 }
             output_ids = self.model.generate(
@@ -248,7 +248,7 @@ class HfRunner:
         for prompt in prompts:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
             output = self.model.generate(
-                input_ids.cuda(),
+                input_ids,
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
