@@ -15,7 +15,7 @@ from torch.utils.cpp_extension import CUDA_HOME
 
 ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
-# Target device of vLLM, supporting [cuda (by default), rocm, neuron, cpu]
+# Target device of vLLM, supporting [cuda (by default), rocm, neuron, openvino, cpu]
 VLLM_TARGET_DEVICE = os.getenv("VLLM_TARGET_DEVICE", "cuda")
 
 # vLLM only supports Linux platform
@@ -214,12 +214,7 @@ def _is_cpu() -> bool:
 
 
 def _is_openvino() -> bool:
-    openvino_available = True
-    try:
-        import openvino
-    except ImportError:
-        openvino_available = False
-    return openvino_available
+    return VLLM_TARGET_DEVICE == "openvino"
 
 
 def _install_punica() -> bool:
@@ -282,9 +277,13 @@ def get_nvcc_cuda_version() -> Version:
 
 
 def get_openvino_version():
-    import openvino
-    return openvino.__version__[:8]
-
+    openvino_version = ""
+    try:
+        import openvino
+        openvino_version = openvino.__version__[:8]
+    except:
+        pass
+    return openvino_version
 
 def get_path(*filepath) -> str:
     return os.path.join(ROOT_DIR, *filepath)
