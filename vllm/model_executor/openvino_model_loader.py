@@ -79,7 +79,6 @@ def paged_attention_transformation(model: ov.Model):
     from openvino.runtime import opset13
     from openvino.runtime.utils import replace_node
 
-    #model.remove_parameter(model.input('beam_idx').get_node())
     max_context_len = set_name(opset13.parameter(shape=[], dtype=np.int64), name='max_context_len')  # max_context_len
     model_remaining_params = [
         set_name(opset13.parameter(shape=[], dtype=bool), name='is_prompt'),  # is_prompt
@@ -132,7 +131,8 @@ def paged_attention_transformation(model: ov.Model):
                 interim = WrapType("opset13.StridedSlice", [interim, *[AnyInput() for _ in range(3)]])
                 interim = WrapType("opset13.Broadcast", [Or([unsqueeze, interim]), AnyInput()])
                 interim = WrapType("opset13.Reshape", [interim, AnyInput()])
-                return interim
+                # Return unsqeeze to deduce number of kv heads in the place where they are being broadcases in case of GQA and MQA
+                return interim, unsqueeze
 
             v_past_var = WrapType("opset13.ReadValue", AnyInput())
             v_past_par = WrapType("opset13.Parameter")
@@ -143,8 +143,8 @@ def paged_attention_transformation(model: ov.Model):
             v_current_reshaped = WrapType("opset13.Reshape", [v_current2, AnyInput()])
             v_concat = WrapType("opset13.Concat", [v_past, Or([v_current_reshaped, v_current])])
 
-            k_shaped = kv_shaping(k_concat)
-            v_shaped = kv_shaping(v_concat)
+            k_shaped, k_heads_unsqueeze = kv_shaping(k_concat)
+            v_shaped, v_heads_unsqueeze = kv_shaping(v_concat)
 
             k_simply_shaped = WrapType("opset13.Reshape", [k_concat, AnyInput()])
             v_simply_shaped = WrapType("opset13.Reshape", [v_concat, AnyInput()])
@@ -189,13 +189,47 @@ def paged_attention_transformation(model: ov.Model):
 
                 real_k = take_4d(k_current, k_current_reshaped, k_current2)
                 real_v = take_4d(v_current, v_current_reshaped, v_current2)
+
+                sdpa_node = mapping[sdpa].get_node()
+                # E and Ev are from the SDPA specification at https://docs.openvino.ai/2024/documentation/openvino-ir-format/operation-sets/operation-specs/sequence/scaled-dot-product-attention.html
+                E = sdpa_node.get_input_tensor(1).get_partial_shape()[-1]
+                Ev = sdpa_node.get_input_tensor(2).get_partial_shape()[-1]  # in common case may not match E
+                num_q_heads = sdpa_node.get_input_tensor(0).get_partial_shape()[-3]
+
+                def extract_num_kv_heads(unsqueeze):
+                    # Deduce number of k/v heads from Unsqueeze-Broadcast-Reshape (if present) pattern that appears in case of MQA/GQA
+                    if unsqueeze in mapping:
+                        # based on unsqueeze index determine the dimension that will be broadcased
+                        # if there is no expected dimension for any reason, return dynamic dimension
+                        unsqueeze = mapping[unsqueeze].get_node()
+                        shape = unsqueeze.get_output_partial_shape(0)
+                        rank = shape.rank
+                        if rank.is_dynamic:
+                            return ov.Dimension()
+                        rank = rank.get_length()
+                        axis = unsqueeze.input_value(1).get_node()
+                        if not hasattr(axis, 'get_data'):
+                            return ov.Dimension()
+                        axis = axis.get_data(dtype=np.int64)
+                        if axis.size != 1:  # it should be only one axis
+                            return ov.Dimension()
+                        axis = axis.flatten()[0]
+                        if axis == 0 or axis == -rank:  # there should be at least one dimension to the left
+                            return ov.Dimension()
+                        return shape[axis - 1]
+                    else:
+                        return num_q_heads
+
+                num_k_heads = extract_num_kv_heads(k_heads_unsqueeze)
+                num_v_heads = extract_num_kv_heads(v_heads_unsqueeze)
                 kv_cache_type = real_q.get_element_type()
                 layer_index_str = str(self.layer_index)
-                k_parameter = set_name(opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_type), name='key_cache.' + layer_index_str)
-                v_parameter = set_name(opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_type), name='value_cache.' + layer_index_str)
+                k_parameter = set_name(opset13.parameter(shape=[-1, num_k_heads, E], dtype=kv_cache_type), name='key_cache.' + layer_index_str)
+                v_parameter = set_name(opset13.parameter(shape=[-1, num_v_heads, Ev], dtype=kv_cache_type), name='value_cache.' + layer_index_str)
                 self.layer_index += 1
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
+
                 q_transpose = opset13.transpose(real_q, kv_transpose_order)
                 q_reshape = opset13.reshape(q_transpose, opset13.constant([0, 0, -1]), True)
 
@@ -398,11 +432,20 @@ def modify_cache_parameters(
         if len(input_names) != 1:
             continue
         input_name = next(iter(input_names))
+        shape = parameter.get_shape()
+        x_size = 1  # use real block size if available, just a placeholder to provide the expected rank
+        num_blocks = ov.Dimension()
+        block_size = ov.Dimension()
+        # TODO: Negotiate required layout with plugins (CPU is ~OK, GPU is TBD), pass more parameters to this function to set more static dimensions
         if input_name.startswith('key_cache.'):
-            if is_cpu:
-                parameter.set_partial_shape(ov.PartialShape([-1, -1, -1, -1]))
-        elif not input_name.startswith('value_cache.'):
+            cpu_shape = [num_blocks, shape[1], block_size, shape[2]]
+            gpu_shape = [num_blocks, shape[1], shape[2]/x_size, block_size, x_size]
+        elif input_name.startswith('value_cache.'):
+            cpu_shape = [num_blocks, shape[1], block_size, shape[2]]
+            gpu_shape = [num_blocks, shape[1], shape[2], block_size]
+        else:
             continue
+        parameter.set_partial_shape(ov.PartialShape(cpu_shape if is_cpu else gpu_shape))
         parameter.set_element_type(kv_cache_dtype)
     model.validate_nodes_and_infer_types()
 
