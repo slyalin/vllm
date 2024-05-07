@@ -432,14 +432,14 @@ def modify_cache_parameters(
         if len(input_names) != 1:
             continue
         input_name = next(iter(input_names))
-        shape = parameter.get_shape()
+        shape = parameter.get_partial_shape()
         x_size = 1  # use real block size if available, just a placeholder to provide the expected rank
         num_blocks = ov.Dimension()
         block_size = ov.Dimension()
         # TODO: Negotiate required layout with plugins (CPU is ~OK, GPU is TBD), pass more parameters to this function to set more static dimensions
         if input_name.startswith('key_cache.'):
             cpu_shape = [num_blocks, shape[1], block_size, shape[2]]
-            gpu_shape = [num_blocks, shape[1], shape[2]/x_size, block_size, x_size]
+            gpu_shape = [num_blocks, shape[1], shape[2].get_length()//x_size if shape[2].is_static else ov.Dimension(), block_size, x_size]
         elif input_name.startswith('value_cache.'):
             cpu_shape = [num_blocks, shape[1], block_size, shape[2]]
             gpu_shape = [num_blocks, shape[1], shape[2], block_size]
@@ -454,7 +454,7 @@ def patch_stateful_model(
     model: ov.Model,
     kv_cache_dtype: Type,
     is_cpu: bool):
-    transformation_in_openvino = False
+    transformation_in_openvino = True
     if transformation_in_openvino:
         from openvino._offline_transformations import paged_attention_transformation as transformation
         transformation(model)
