@@ -394,17 +394,17 @@ class ModelRunner:
                      out=seq_start_loc[1:])
 
         attn_metadata = self.attn_backend.make_metadata(
-            is_prompt=True,
-            prompt_lens=prompt_lens,
-            prompt_lens_tensor=prompt_lens_tensor,
-            max_subquery_len=max_subquery_len,
-            max_context_len=None,
-            max_prompt_len=max_prompt_len,
+            # is_prompt=True,
+            # prompt_lens=prompt_lens,
+            # prompt_lens_tensor=prompt_lens_tensor,
+            # max_subquery_len=max_subquery_len,
+            # max_context_len=None,
+            # max_prompt_len=max_prompt_len,
             subquery_start_loc=subquery_start_loc,
             seq_start_loc=seq_start_loc,
-            context_lens=context_lens_tensor,
-            block_tables=block_tables,
-            use_cuda_graph=False,
+            # context_lens=context_lens_tensor,
+            # block_tables=block_tables,
+            # use_cuda_graph=False,
         )
 
         return PreparePromptMetadata(

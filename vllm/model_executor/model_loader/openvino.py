@@ -2,9 +2,13 @@
 import copy
 import glob
 import os
+from functools import partial
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Optional, Tuple, Type
+from huggingface_hub import HfApi
 
+import numpy as np
 import huggingface_hub
 import torch
 from torch import nn
@@ -12,6 +16,11 @@ from torch import nn
 from vllm.config import (DeviceConfig, ModelConfig)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.sequence import SamplerOutput
+from vllm.utils import is_openvino_optimum_intel, STR_DTYPE_TO_TORCH_DTYPE
+
+import openvino as ov
 
 logger = init_logger(__name__)
 
@@ -51,6 +60,7 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
         inputs.append(attn_metadata.context_lens)
         inputs.append(attn_metadata.block_tables)
     else:
+        print(kwargs['input_ids'].shape)
         inputs.append(np.array(kwargs['input_ids'].shape[1], dtype=np.int64))   # for optimum-based models this parameter can be used even on the first iteration
 
     self._ov_request.start_async(inputs, share_inputs=True)
@@ -70,7 +80,7 @@ def arguments_as_outputs(arguments):
 
 def patch_stateful_model(
     model: ov.Model,
-    kv_cache_dtype: Type):
+    kv_cache_dtype: ov.Type):
     logger.warning('Transforming OPTIMUM-INTEL model to vLLM compatible form with PagedAttention')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -448,7 +458,7 @@ def ov_compute_logits(self, hidden_states: torch.Tensor,
 
 def get_model(model_config: ModelConfig,
               device_config: DeviceConfig,
-              kv_cache_dtype: Type,
+              kv_cache_dtype: ov.Type,
               **kwargs) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
     if lora_config:
@@ -481,6 +491,7 @@ def get_model(model_config: ModelConfig,
         load_in_8bit=load_in_8bit,
         trust_remote_code=model_config.trust_remote_code
     )
+
     patch_stateful_model(pt_model.model, kv_cache_dtype)
 
     # For deployment outside vLLM
@@ -496,11 +507,11 @@ def get_model(model_config: ModelConfig,
     pt_model.forward = partial(ov_wrapper, pt_model)
 
     from vllm.model_executor.layers.sampler import Sampler
-    pt_model.sampler = Sampler(model_config.hf_config.vocab_size)
+    pt_model.sampler = Sampler()
     pt_model.sample = partial(ov_sample, pt_model)
 
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
-    pt_model.logits_processor = LogitsProcessor(config.vocab_size,
+    pt_model.logits_processor = LogitsProcessor(model_config.hf_config.vocab_size,
                                                 logits_as_input=True)
     pt_model.compute_logits = partial(ov_compute_logits, pt_model)
 

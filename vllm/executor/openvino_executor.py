@@ -104,7 +104,7 @@ class OpenVINOExecutor(ExecutorBase):
         return
 
 
-class OpenVINOExecutorAsync(CPUExecutor, ExecutorAsyncBase):
+class OpenVINOExecutorAsync(OpenVINOExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
         self,
@@ -155,14 +155,14 @@ def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
 
     if os.environ.get("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", "") == "u8":
         logger.warning("KV cache type is overried to u8 via VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
-        cache_config.cache_dtype = "u8"
+        config.cache_dtype = ov.Type.u8
     else:
         core = ov.Core()
         inference_precision = core.get_property("CPU", hints.inference_precision)
         if inference_precision == ov.Type.bf16:
-            cache_config.cache_dtype = torch.bfloat16
+            config.cache_dtype = ov.Type.bf16
         else:
-            cache_config.cache_dtype = torch.float16
+            config.cache_dtype = ov.Type.f16
 
     kv_cache_space_str = os.getenv("VLLM_OPENVINO_KVCACHE_SPACE", "0")
     kv_cache_space = int(kv_cache_space_str)

@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.layers.ops.sample import sample as sample_triton
 from vllm.model_executor.sampling_metadata import (SamplingMetadata,
                                                    SamplingTensors,
                                                    SequenceGroupToSample)
@@ -599,6 +598,7 @@ def _sample_with_triton_kernel(
         else:
             raise ValueError(f"Unsupported sampling type: {sampling_type}")
 
+    from vllm.model_executor.layers.ops.sample import sample as sample_triton
     sampled_tokens, _, _ = sample_triton(
         probs=probs,
         seeds=sampling_tensors.sampling_seeds,

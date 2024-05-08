@@ -64,7 +64,8 @@ class OpenVINOModelRunner:
     def load_model(self) -> None:
         self.model = get_model(
             model_config=self.model_config,
-            device_config=self.device_config)
+            device_config=self.device_config,
+            kv_cache_dtype=self.kv_cache_dtype)
 
     def _prepare_prompt(
         self,

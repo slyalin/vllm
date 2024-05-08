@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
+import openvino as ov
 
 from vllm.attention import get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
@@ -15,7 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.worker.cpu_model_runner import CPUModelRunner
+from vllm.worker.openvino_model_runner import OpenVINOModelRunner
 from vllm.worker.worker_base import LoraNotSupportedWorkerBase
 
 logger = init_logger(__name__)
@@ -47,11 +48,6 @@ class OpenVINOCacheEngine:
         # in the scheduler.
         self.num_cpu_blocks = cache_config.num_gpu_blocks
 
-        if cache_config.cache_dtype == "auto":
-            self.dtype = model_config.dtype
-        else:
-            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-
         # Initialize the cache.
         self.kv_cache = self._allocate_kv_cache(self.num_cpu_blocks)
 
@@ -70,8 +66,8 @@ class OpenVINOCacheEngine:
         value_block_shape = (self.num_cpu_blocks, *self._get_value_block_shape())
         kv_cache: List[ov.Tensor] = []
         for _ in range(self.num_layers):
-            key_blocks = ov.Tensor(self.cache_dtype, key_block_shape)
-            value_blocks = ov.Tensor(self.cache_dtype, value_block_shape)
+            key_blocks = ov.Tensor(self.cache_config.cache_dtype, key_block_shape)
+            value_blocks = ov.Tensor(self.cache_config.cache_dtype, value_block_shape)
             kv_cache.append((key_blocks, value_blocks))
         return kv_cache
 
@@ -91,7 +87,7 @@ class OpenVINOCacheEngine:
     @staticmethod
     def get_cache_block_size(
         block_size: int,
-        cache_dtype: str,
+        cache_dtype: ov.Type,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
@@ -99,7 +95,7 @@ class OpenVINOCacheEngine:
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
 
-        if cache_dtype == "u8":
+        if cache_dtype == ov.Type.u8:
             # Scale, zero point and quantized data will be stored together.
             # The layout for per token per head:
             # |scale(f32)|zeropoint(f32)|quantized data(u8,idx_1)|quantized data(u8,idx_2)|...|quantized data(u8,idx_head_size)|
@@ -108,11 +104,7 @@ class OpenVINOCacheEngine:
         key_cache_block = block_size * num_heads * head_size
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
-        if cache_dtype == "auto":
-            dtype = model_config.dtype
-        else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
-        dtype_size = torch.tensor([], dtype=dtype).element_size()
+        dtype_size = cache_dtype.size
         return dtype_size * total
 
 
@@ -137,7 +129,7 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
-        kv_cache_dtype: Optional[str] = "auto",
+        kv_cache_dtype: Optional[ov.Type] = ov.Type.undefined,
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -257,8 +249,8 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
 
         # Populate the cache to warmup the memory
         for key_cache, value_cache in self.kv_cache:
-            key_cache.data[dst, :] = key_cache.data[src, :]
-            value_cache.data[dst, :] = value_cache.data[src, :]
+            key_cache.data[:] = 0
+            value_cache.data[:] = 0
 
     def cache_copy(
         self,
