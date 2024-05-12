@@ -164,14 +164,11 @@ class OpenVINOCasualLM(nn.Module):
             attn_metadata.slot_mapping
         ]
 
+        # available from the second iteration
         if attn_metadata.max_seq_len is not None:
-            # available from the second iteration
             inputs.append(attn_metadata.max_seq_len)
             inputs.append(attn_metadata.seq_lens)
             inputs.append(attn_metadata.block_tables)
-        else:
-            print(input_ids.shape)
-            inputs.append(np.array(input_ids.shape[1], dtype=np.int64))   # for optimum-based models this parameter can be used even on the first iteration
 
         self.ov_request.start_async(inputs, share_inputs=True)
         self.ov_request.wait()
