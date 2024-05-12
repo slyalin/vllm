@@ -153,7 +153,6 @@ class OpenVINOCasualLM(nn.Module):
         kv_caches: List[Tuple[ov.Tensor, ov.Tensor]],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        print('OpenVINO Model inference')
         flatten_kv_cache = _flattenize_inputs(kv_caches)
 
         inputs = [

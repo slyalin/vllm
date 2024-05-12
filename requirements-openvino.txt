@@ -3,7 +3,7 @@
 
 # OpenVINO dependencies
 torch >= 2.1.2
-openvino >= 2024.1.0
+openvino ~= 2024.2.0.dev
 optimum-intel[openvino] >= 1.16.1
 einops
 ai2-olmo # hf_olmo

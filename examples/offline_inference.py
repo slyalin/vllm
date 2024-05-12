@@ -11,7 +11,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0, seed=42, max_tokens=30)
 
 # Create an LLM.
-llm = LLM(model="/home/sandye51/Documents/Programming/git_repo/vllm/opt125m")
+llm = LLM(model="facebook/opt-125m")
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
