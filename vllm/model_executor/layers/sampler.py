@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.layers.ops.sample import sample as sample_triton
 from vllm.model_executor.sampling_metadata import (SamplingMetadata,
                                                    SamplingTensors,
                                                    SequenceGroupToSample)
@@ -56,7 +57,6 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
-        print(f"Logits shape: {logits.shape}")
         _, vocab_size = logits.shape
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
@@ -598,7 +598,6 @@ def _sample_with_triton_kernel(
         else:
             raise ValueError(f"Unsupported sampling type: {sampling_type}")
 
-    from vllm.model_executor.layers.ops.sample import sample as sample_triton
     sampled_tokens, _, _ = sample_triton(
         probs=probs,
         seeds=sampling_tensors.sampling_seeds,

@@ -9,3 +9,5 @@ einops
 ai2-olmo # hf_olmo
 transformers_stream_generator
 bitsandbytes
+
+triton >= 2.2.0  # FIXME(woosuk): This is a hack to avoid import error.

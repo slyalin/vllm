@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
@@ -173,7 +174,6 @@ class PagedAttention:
         sliding_window: Optional[int],
     ) -> torch.Tensor:
         output = torch.empty_like(query)
-        from vllm.attention.ops.prefix_prefill import context_attention_fwd
         context_attention_fwd(
             query,
             key,

@@ -15,7 +15,7 @@ from torch import nn
 
 from vllm.config import (DeviceConfig, ModelConfig)
 from vllm.logger import init_logger
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.logits_processor import LogitsProcessor, _prune_hidden_states
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
@@ -24,6 +24,7 @@ from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.backends.torch_sdpa import TorchSDPAMetadata
 
 import openvino as ov
+from openvino._offline_transformations import paged_attention_transformation
 
 logger = init_logger(__name__)
 
@@ -132,7 +133,6 @@ class OpenVINOCasualLM(nn.Module):
             trust_remote_code=model_config.trust_remote_code
         )
 
-        from openvino._offline_transformations import paged_attention_transformation
         paged_attention_transformation(pt_model.model)
         _modify_cache_parameters(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
 
@@ -172,11 +172,16 @@ class OpenVINOCasualLM(nn.Module):
 
         self.ov_request.start_async(inputs, share_inputs=True)
         self.ov_request.wait()
-        return torch.from_numpy(self.ov_request.get_tensor("logits").data)
+
+        logits = torch.from_numpy(self.ov_request.get_tensor("logits").data)
+
+        # TODO: remove `view` after migration to new PA interface with fused batch and seq_len
+        return logits.view(-1, logits.shape[-1])
 
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
         logits = self.logits_processor(None, hidden_states, sampling_metadata)
         return logits
 
