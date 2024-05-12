@@ -1,4 +1,4 @@
-"""A CPU worker class."""
+"""An OpenVINO worker class."""
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -64,7 +64,7 @@ class OpenVINOCacheEngine:
         """Allocates KV cache."""
         key_block_shape = (self.num_cpu_blocks, *self._get_key_block_shape())
         value_block_shape = (self.num_cpu_blocks, *self._get_value_block_shape())
-        kv_cache: List[ov.Tensor] = []
+        kv_cache: List[Tuple[ov.Tensor, ov.Tensor]] = []
         for _ in range(self.num_layers):
             key_blocks = ov.Tensor(self.cache_config.cache_dtype, key_block_shape)
             value_blocks = ov.Tensor(self.cache_config.cache_dtype, value_block_shape)
@@ -164,7 +164,7 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: OpenVINOCacheEngine
-        self.kv_cache: List[torch.Tensor]
+        self.kv_cache: List[Tuple[ov.Tensor, ov.Tensor]]
 
     def init_device(self) -> None:
         self.init_distributed_environment()

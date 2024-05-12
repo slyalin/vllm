@@ -117,7 +117,7 @@ def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
         config.dtype = torch.float32
     if not config.enforce_eager:
         logger.warning(
-            "CUDA graph is not supported on CPU, fallback to the eager "
+            "CUDA graph is not supported on OpenVINO backend, fallback to the eager "
             "mode.")
         config.enforce_eager = True
     return config
@@ -151,6 +151,10 @@ def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
 
     kv_cache_space_str = os.getenv("VLLM_OPENVINO_KVCACHE_SPACE", "0")
     kv_cache_space = int(kv_cache_space_str)
+
+    if config.block_size != 32:
+        logger.warning(f"OpenVINO optimal block size is 32, overriding currently set {config.block_size}")
+        config.block_size = 32
 
     if kv_cache_space >= 0:
         if kv_cache_space == 0:

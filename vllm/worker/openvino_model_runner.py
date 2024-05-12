@@ -136,12 +136,13 @@ class OpenVINOModelRunner:
         else:
             multi_modal_input = None
 
-        # TODO: not used correctly
+        # TODO: not used correctly, because 'input_tokens' is not flat list
         num_prompt_tokens = len(input_tokens)
 
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
 
+        # TODO: remove 'make_tensor_with_pad' after migration to new PA interface
         input_tokens = make_tensor_with_pad(input_tokens,
                                             max_seq_len,
                                             pad=0,

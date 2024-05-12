@@ -47,9 +47,9 @@ def _flattenize_inputs(inputs):
 
 
 def _modify_cache_parameters(
-        model: ov.Model,
-        kv_cache_dtype: ov.Type,
-        is_cpu: bool
+    model: ov.Model,
+    kv_cache_dtype: ov.Type,
+    is_cpu: bool
 ):
     # Apply hardware dependent modifications to KV tensors
     for parameter in model.get_parameters():
