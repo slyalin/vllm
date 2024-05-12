@@ -43,6 +43,8 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if self.logits_as_input:
             logits = hidden_states
+            # TODO: OpenVINO specific
+            logits = _prune_hidden_states(logits, sampling_metadata)
         else:
             hidden_states = _prune_hidden_states(hidden_states,
                                                  sampling_metadata)
@@ -81,6 +83,9 @@ def _prune_hidden_states(
     hidden_states: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    # TODO: looks like we need to consider paddings within sampling_metadata.selected_token_indices information
+    print(f"Shape {hidden_states.shape}, {sampling_metadata.selected_token_indices}")
     return hidden_states.index_select(0,
                                       sampling_metadata.selected_token_indices)
 
