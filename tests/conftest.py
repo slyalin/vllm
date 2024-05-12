@@ -165,13 +165,13 @@ class HfRunner:
             self.model = SentenceTransformer(
                 model_name,
                 device="cpu",
-            ).to(dtype=torch_dtype).cuda()
+            ).to(dtype=torch_dtype)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
-            ).cuda()
+            )
             self.processor = None
         if tokenizer_name is None:
             tokenizer_name = model_name
@@ -296,7 +296,7 @@ class HfRunner:
         for prompt in prompts:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
             output = self.model.generate(
-                input_ids.cuda(),
+                input_ids,
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
