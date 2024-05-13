@@ -79,18 +79,17 @@ def paged_attention_transformation(model: ov.Model):
     from openvino.runtime import opset13
     from openvino.runtime.utils import replace_node
 
-    max_context_len = set_name(opset13.parameter(shape=[], dtype=np.int64), name='max_context_len')  # max_context_len
+    max_context_len = set_name(opset13.parameter(shape=[], dtype=np.int32), name='max_context_len')  # max_context_len
     model_remaining_params = [
-        set_name(opset13.parameter(shape=[], dtype=bool), name='is_prompt'),  # is_prompt
-        set_name(opset13.parameter(shape=[-1, -1], dtype=np.int64), name='slot_mapping'),  # slot mapping
-        max_context_len,
-        set_name(opset13.parameter(shape=[-1], dtype=np.int64), name='context_lens'),  # context_lens
-        set_name(opset13.parameter(shape=[-1, -1], dtype=np.int32), name='block_tables'),  # block_tables
+        set_name(opset13.parameter(shape=[-1], dtype=np.int32), name='context_lens'),
+        set_name(opset13.parameter(shape=[-1], dtype=np.int32), name='subsequence_begins'),
+        set_name(opset13.parameter(shape=[-1], dtype=np.int32), name='block_indices'),
+        set_name(opset13.parameter(shape=[-1], dtype=np.int32), name='block_indices_begins'),
     ]
     sliding_window = opset13.constant(np.array(0, np.int32))  # sliding_window
 
     current_seq_len = opset13.gather(opset13.shape_of(model.input('input_ids')), opset13.constant(1), opset13.constant(0))
-    prev_max_seq_len = max_context_len - current_seq_len
+    prev_max_seq_len = max_context_len - opset13.convert(current_seq_len, ov.Type.i32)  # TODO: this term shouldn't be needed
 
     def has_parameter(model, name):
         return name in sum([list(t.get_names()) for t in model.inputs], [])
@@ -105,7 +104,7 @@ def paged_attention_transformation(model: ov.Model):
         print('CREATED A NEW position_ids PARAMETER')
     position_ids = model.input('position_ids')
 
-    kv_transpose_order = opset13.constant([0, 2, 1, 3])
+    kv_transpose_order = opset13.constant([0, 2, 1, 3])  # TODO: revisit order of dimensions for the new PA
 
     class StateManagementPattern(MatcherPass):
         def __init__(self):
@@ -231,19 +230,20 @@ def paged_attention_transformation(model: ov.Model):
                 kv_parameters.append(v_parameter)
 
                 q_transpose = opset13.transpose(real_q, kv_transpose_order)
-                q_reshape = opset13.reshape(q_transpose, opset13.constant([0, 0, -1]), True)
+
+                q_reshape = opset13.reshape(q_transpose, opset13.constant([0, -1]), True)
 
                 k_tranpose_order = kv_transpose_order
                 if k_order in mapping:  # reapply transpose found in the graph by manipulating of indices of our Transpose
                     k_tranpose_order = opset13.gather(mapping[k_order], kv_transpose_order, opset13.constant(0))
                 k_transpose = opset13.transpose(real_k, k_tranpose_order)
-                k_reshape = opset13.reshape(k_transpose, opset13.constant([0, 0, -1]), True)
+                k_reshape = opset13.reshape(k_transpose, opset13.constant([0, -1]), True)
 
                 v_tranpose_order = kv_transpose_order
                 if v_order in mapping:  # reapply transpose found in the graph by manipulating of indices of our Transpose
                     v_tranpose_order = opset13.gather(mapping[v_order], kv_transpose_order, opset13.constant(0))
                 v_transpose = opset13.transpose(real_v, v_tranpose_order)
-                v_reshape = opset13.reshape(v_transpose, opset13.constant([0, 0, -1]), True)
+                v_reshape = opset13.reshape(v_transpose, opset13.constant([0, -1]), True)
 
                 # TODO: Detect whether SDPA in the model graph has `scale` argument set and use it instead of the computed scale below
                 # Most likely `scale` will always be a constant in real inference, but dynamic dimension propagation may not always derive it as a constant
@@ -268,12 +268,13 @@ def paged_attention_transformation(model: ov.Model):
                     v_parameter,
                     *model_remaining_params,
                     scale,
+                    sliding_window,
                     alibi_slopes,
-                    sliding_window
+                    max_context_len,
                 ]))
                 pa_shape = opset13.concat([
                         opset13.constant([0]),
-                        opset13.constant([0]),
+                        opset13.constant([1]),
                         opset13.constant([-1]),
                         opset13.unsqueeze(hidden_dim, opset13.constant(0))
                     ], axis=0)
@@ -418,6 +419,7 @@ def paged_attention_transformation(model: ov.Model):
         model.remove_result(result)
     model.add_parameters(kv_parameters)
     model.add_parameters(model_remaining_params)
+    model.add_parameters([max_context_len])
     print('PARAMETERS ARE REORGANIZED, THE STATE (IF EXISTS) IS REMOVED')
 
 def modify_cache_parameters(
@@ -454,7 +456,7 @@ def patch_stateful_model(
     model: ov.Model,
     kv_cache_dtype: Type,
     is_cpu: bool):
-    transformation_in_openvino = True
+    transformation_in_openvino = False
     if transformation_in_openvino:
         from openvino._offline_transformations import paged_attention_transformation as transformation
         transformation(model)
