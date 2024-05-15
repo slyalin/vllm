@@ -38,21 +38,33 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     flatten_kv_cache = _flattenize_inputs(kwargs['kv_caches'])
 
     inputs = [
-        kwargs['input_ids'],
-        kwargs['positions'],
+        kwargs['input_ids'].flatten(),
+        kwargs['positions'].flatten(),
         *flatten_kv_cache,
-        input_metadata.is_prompt,
-        input_metadata.slot_mapping
     ]
+
+    print('input_metadata.max_context_len:', input_metadata.max_context_len)
+
+    print('input_metadata.block_tables:', input_metadata.block_tables)
 
     if input_metadata.max_context_len is not None:
         # available from the second iteration
-        inputs.append(input_metadata.max_context_len)
         inputs.append(input_metadata.context_lens)
-        inputs.append(input_metadata.block_tables)
+        inputs.append(input_metadata.context_lens)
+        inputs.append(input_metadata.block_tables.flatten())
+        inputs.append(input_metadata.context_lens)
+        inputs.append(input_metadata.max_context_len)
     else:
-        inputs.append(np.array(kwargs['input_ids'].shape[1], dtype=np.int64))   # for optimum-based models this parameter can be used even on the first iteration
+        inputs.append(np.array([1, 2, 3, 4], dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
+        inputs.append(np.array([1, 2, 3, 4], dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
+        inputs.append(np.array([1, 2, 3, 4], dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
+        inputs.append(np.array([1, 2, 3, 4], dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
+        inputs.append(np.array(kwargs['input_ids'].shape[1], dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
 
+
+    print(inputs[-4:])
+
+    print(input_metadata.slot_mapping)
     self._ov_request.start_async(inputs, share_inputs=True)
     self._ov_request.wait()
     return torch.from_numpy(self._ov_request.get_tensor("logits").data)
@@ -73,6 +85,14 @@ def set_name(node, name):
     node.get_output_tensor(0).set_names({name})
     return node
 
+def replace_node_consumers(old_node, new_node):
+    for output_idx, output in enumerate(old_node.outputs()):
+        consumers = output.get_target_inputs()
+        for consumer in consumers:
+            if consumer.get_node() is new_node:
+                continue
+            consumer.replace_source_output(new_node.output(output_idx))
+
 def paged_attention_transformation(model: ov.Model):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
@@ -88,7 +108,13 @@ def paged_attention_transformation(model: ov.Model):
     ]
     sliding_window = opset13.constant(np.array(0, np.int32))  # sliding_window
 
-    current_seq_len = opset13.gather(opset13.shape_of(model.input('input_ids')), opset13.constant(1), opset13.constant(0))
+    input_ids = model.input('input_ids').get_node()
+    input_ids.set_partial_shape(ov.PartialShape([-1]))
+    unsqueezed_input_ids = opset13.unsqueeze(input_ids, opset13.constant(1))  # inject sequence dimension = 1
+    replace_node_consumers(input_ids, unsqueezed_input_ids)
+    input_ids = unsqueezed_input_ids
+
+    current_seq_len = opset13.gather(opset13.shape_of(input_ids), opset13.constant(1), opset13.constant(0))
     prev_max_seq_len = max_context_len - opset13.convert(current_seq_len, ov.Type.i32)  # TODO: this term shouldn't be needed
 
     def has_parameter(model, name):
@@ -99,10 +125,16 @@ def paged_attention_transformation(model: ov.Model):
     parameters_to_remove = []
     results_to_remove = []  # used, but cannot really track all Results in stateless model
     if not has_parameter(model, 'position_ids'):
-        position_ids = set_name(opset13.parameter(shape=[-1, -1], dtype=np.int64), name="position_ids")
+        position_ids = set_name(opset13.parameter(shape=[-1], dtype=np.int64), name="position_ids")
         model.add_parameters([position_ids])
         print('CREATED A NEW position_ids PARAMETER')
-    position_ids = model.input('position_ids')
+    else:
+        position_ids = model.input('position_ids').get_node()
+        position_ids.set_partial_shape(ov.PartialShape([-1]))
+
+    unsqueezed_position_ids = opset13.unsqueeze(position_ids, opset13.constant(1))  # inject sequence dimension = 1
+    replace_node_consumers(position_ids, unsqueezed_position_ids)
+    position_ids = unsqueezed_position_ids
 
     kv_transpose_order = opset13.constant([0, 2, 1, 3])  # TODO: revisit order of dimensions for the new PA
 
@@ -385,7 +417,7 @@ def paged_attention_transformation(model: ov.Model):
 
             def callback(m: Matcher) -> bool:
                 mapping = m.get_pattern_value_map()
-                replace_node(mapping[position_ids_pattern].get_node(), position_ids.get_node())
+                replace_node(mapping[position_ids_pattern].get_node(), position_ids)
                 print('APPLIED position_ids PARAMETER INSTEAD OF attention_mask-BASED SUB-GRAPH')
                 return True
 
