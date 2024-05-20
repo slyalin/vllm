@@ -20,8 +20,7 @@ from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_openvino_optimum_intel, STR_DTYPE_TO_TORCH_DTYPE
-from vllm.attention.backends.abstract import AttentionMetadata
-from vllm.attention.backends.torch_sdpa import TorchSDPAMetadata
+from vllm.attention.backends.openvino import OpenVINOAttentionMetadata
 
 import openvino as ov
 from openvino._offline_transformations import paged_attention_transformation
@@ -151,7 +150,7 @@ class OpenVINOCasualLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[Tuple[ov.Tensor, ov.Tensor]],
-        attn_metadata: AttentionMetadata,
+        attn_metadata: OpenVINOAttentionMetadata,
     ) -> torch.Tensor:
         flatten_kv_cache = _flattenize_inputs(kv_caches)
 
@@ -159,22 +158,19 @@ class OpenVINOCasualLM(nn.Module):
             input_ids,
             positions,
             *flatten_kv_cache,
-            attn_metadata.is_prompt,
-            attn_metadata.slot_mapping
+            attn_metadata.context_lens,
+            attn_metadata.subsequence_begins,
+            attn_metadata.block_indices,
+            attn_metadata.block_indices_begins,
+            attn_metadata.max_context_len
         ]
-
-        # available from the second iteration
-        if attn_metadata.max_seq_len is not None:
-            inputs.append(attn_metadata.max_seq_len)
-            inputs.append(attn_metadata.seq_lens)
-            inputs.append(attn_metadata.block_tables)
 
         self.ov_request.start_async(inputs, share_inputs=True)
         self.ov_request.wait()
 
         logits = torch.from_numpy(self.ov_request.get_tensor("logits").data)
 
-        # TODO: remove `view` after migration to new PA interface with fused batch and seq_len
+        # TODO: remove 'view' once OpenVINO PA will drop 'seq_len' dimension
         return logits.view(-1, logits.shape[-1])
 
 

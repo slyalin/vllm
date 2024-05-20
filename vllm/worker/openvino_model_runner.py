@@ -3,15 +3,14 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 
-from vllm.attention import AttentionMetadata, get_attn_backend
+from vllm.attention import get_attn_backend
+from vllm.attention.backends.openvino import OpenVINOAttentionMetadata
 from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
-from vllm.distributed import broadcast_tensor_dict
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.model_loader.openvino import get_model
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
-from vllm.utils import make_tensor_with_pad
 
 logger = init_logger(__name__)
 
@@ -54,7 +53,6 @@ class OpenVINOModelRunner:
 
         self.kv_cache_dtype = kv_cache_dtype
 
-        # TODO: create OpenVINOAttentionMetadata
         self.attn_backend = get_attn_backend(
             self.model_config.dtype if model_config is not None else None)
 
@@ -72,14 +70,21 @@ class OpenVINOModelRunner:
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, OpenVINOAttentionMetadata, List[int],
                Optional[torch.Tensor]]:
         assert len(seq_group_metadata_list) > 0
-        input_tokens: List[List[int]] = []
-        input_positions: List[List[int]] = []
-        slot_mapping: List[List[int]] = []
-        seq_lens: List[int] = []
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        seq_lens: List[int] = [] # TODO: remove it with support of prefix_cache, chunked_prefill
+        context_lens: List[int] = []
+        subsequence_begins: List[int] = []
+        block_indices: List[int] = []
+        block_indices_begins: List[int] = []
         multi_modal_input_list: List[torch.Tensor] = []
+
+        # initialize beginning of prefix sums
+        subsequence_begins.append(0)
+        block_indices_begins.append(0)
 
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
@@ -88,44 +93,28 @@ class OpenVINOModelRunner:
             seq_id = seq_ids[0]
 
             seq_data = seq_group_metadata.seq_data[seq_id]
+            block_table = seq_group_metadata.block_tables[seq_id]
             prompt_tokens = seq_data.get_token_ids()
             computed_len = seq_data.get_num_computed_tokens()
-            seq_len = len(prompt_tokens)
+            prompt_len = len(prompt_tokens)
+            subsequence_len = prompt_len - computed_len
 
-            seq_lens.append(seq_len)  # Prompt token num
-            input_tokens.append(prompt_tokens)  # Token ids
+            input_tokens.extend(prompt_tokens)  # Token ids
+            seq_lens.append(prompt_len)
 
             # Token position ids
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
-            input_positions.append(list(range(computed_len, seq_len)))
+            input_positions.extend(list(range(computed_len, prompt_len)))
+
+            context_lens.append(computed_len + 1) # TODO: drop adding + 1
+            subsequence_begins.append(subsequence_begins[-1] + subsequence_len)
+            block_indices.extend(block_table)
+            block_indices_begins.append(block_indices_begins[-1] + len(block_table))
 
             if seq_group_metadata.multi_modal_data:
                 multi_modal_input_list.append(
                     seq_group_metadata.multi_modal_data.data)
-
-            # Compute the slot mapping.
-            slot_mapping.append([])
-            block_table = seq_group_metadata.block_tables[seq_id]
-            # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
-            # where start_idx is max(0, seq_len - sliding_window).
-            # For example, if the prompt len is 10, sliding window is 8, and
-            # block size is 4, the first two tokens are masked and the slot
-            # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
-            start_idx = 0
-            if self.sliding_window is not None:
-                start_idx = max(0, seq_len - self.sliding_window)
-
-            for i in range(computed_len, seq_len):
-                if i < start_idx:
-                    slot_mapping[-1].append(_PAD_SLOT_ID)
-                    continue
-
-                block_number = block_table[i //
-                                           self.block_size]  # type: ignore
-                block_offset = i % self.block_size  # type: ignore
-                slot = block_number * self.block_size + block_offset
-                slot_mapping[-1].append(slot)
 
         if multi_modal_input_list:
             assert self.vision_language_config, (
@@ -136,42 +125,37 @@ class OpenVINOModelRunner:
         else:
             multi_modal_input = None
 
-        # TODO: not used correctly, because 'input_tokens' is not flat list
-        num_prompt_tokens = len(input_tokens)
+        input_tokens = torch.tensor(input_tokens,
+                                    dtype=torch.long,
+                                    device=self.device)  # type: ignore
+        input_positions = torch.tensor(input_positions,
+                                       dtype=torch.long,
+                                       device=self.device)  # type: ignore
 
-        max_seq_len = max(seq_lens)
-        assert max_seq_len > 0
+        context_lens_tensor = torch.tensor(context_lens,
+                                           dtype=torch.int32,
+                                           device=self.device)  # type: ignore
+        subsequence_begins_tensor = torch.tensor(subsequence_begins,
+                                                 dtype=torch.int32,
+                                                 device=self.device)  # type: ignore
+        block_indices_tensor = torch.tensor(block_indices,
+                                            dtype=torch.int32,
+                                            device=self.device)  # type: ignore
+        block_indices_begins_tensor = torch.tensor(block_indices_begins,
+                                                   dtype=torch.int32,
+                                                   device=self.device)  # type: ignore
 
-        # TODO: remove 'make_tensor_with_pad' after migration to new PA interface
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            max_seq_len,
-                                            pad=0,
-                                            dtype=torch.long,
-                                            device=self.device)
-        input_positions = make_tensor_with_pad(input_positions,
-                                               max_seq_len,
-                                               pad=0,
-                                               dtype=torch.long,
-                                               device=self.device)
-        slot_mapping = make_tensor_with_pad(slot_mapping,
-                                            max_seq_len,
-                                            pad=_PAD_SLOT_ID,
-                                            dtype=torch.long,
-                                            device=self.device)
+        max_context_len = max(context_lens)
+        max_context_len_tensor = torch.tensor(max_context_len,
+                                              dtype=torch.int32,
+                                              device=self.device)  # type: ignore
 
         attn_metadata = self.attn_backend.make_metadata(
-            is_prompt=True,
-            seq_lens=seq_lens,
-            seq_lens_tensor=None,
-            max_seq_len=None,
-            num_prefills=len(seq_lens),
-            num_prefill_tokens=num_prompt_tokens,
-            num_decode_tokens=0,
-            prefill_metadata=None,
-            decode_metadata=None,
-            block_tables=torch.tensor([]),
-            slot_mapping=slot_mapping,
-            kv_cache_dtype=self.kv_cache_dtype,
+            context_lens = context_lens_tensor,
+            subsequence_begins = subsequence_begins_tensor,
+            block_indices = block_indices_tensor,
+            block_indices_begins = block_indices_begins_tensor,
+            max_context_len = max_context_len_tensor
         )
         return (input_tokens, input_positions, attn_metadata, seq_lens,
                 multi_modal_input)
@@ -179,13 +163,19 @@ class OpenVINOModelRunner:
     def _prepare_decode(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, OpenVINOAttentionMetadata]:
         assert len(seq_group_metadata_list) > 0
-        input_tokens: List[List[int]] = []
-        input_positions: List[List[int]] = []
-        slot_mapping: List[List[int]] = []
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
         seq_lens: List[int] = []
-        block_tables: List[List[int]] = []
+        context_lens: List[int] = []
+        subsequence_begins: List[int] = []
+        block_indices: List[int] = []
+        block_indices_begins: List[int] = []
+
+        # initialize beginning of prefix sums
+        subsequence_begins.append(0)
+        block_indices_begins.append(0)
 
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
@@ -196,29 +186,26 @@ class OpenVINOModelRunner:
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append([generation_token])
+                input_tokens.append(generation_token)
 
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
-                input_positions.append([position])
+                input_positions.append(position)
 
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
                 seq_lens.append(seq_len)
 
-                block_table = seq_group_metadata.block_tables[seq_id]
-                block_number = block_table[position // self.block_size]
-                block_offset = position % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping.append([slot])
+                context_lens.append(seq_len + 1) # TODO: remove adding + 1
+                subsequence_begins.append(subsequence_begins[-1] + 1)
 
+                block_table = seq_group_metadata.block_tables[seq_id]
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
                                              self.block_size)
                     block_table = block_table[-sliding_window_blocks:]
-                block_tables.append(block_table)
-
-        max_seq_len = max(seq_lens)
+                block_indices.extend(block_table)
+                block_indices_begins.append(block_indices_begins[-1] + len(block_table))
 
         input_tokens = torch.tensor(input_tokens,
                                     dtype=torch.long,
@@ -226,36 +213,31 @@ class OpenVINOModelRunner:
         input_positions = torch.tensor(input_positions,
                                        dtype=torch.long,
                                        device=self.device)
-        slot_mapping = torch.tensor(slot_mapping,
-                                    dtype=torch.long,
-                                    device=self.device)
-        seq_lens_tensor = torch.tensor(seq_lens,
-                                       dtype=torch.int,
-                                       device=self.device)
 
-        max_block_table_len = max(
-            len(block_table) for block_table in block_tables)
-        block_tables = make_tensor_with_pad(
-            block_tables,
-            max_len=max_block_table_len,
-            pad=0,
-            dtype=torch.int,
-            device=self.device,
-        )
+        context_lens_tensor = torch.tensor(context_lens,
+                                           dtype=torch.int32,
+                                           device=self.device)  # type: ignore
+        subsequence_begins_tensor = torch.tensor(subsequence_begins,
+                                                 dtype=torch.int32,
+                                                 device=self.device)  # type: ignore
+        block_indices_tensor = torch.tensor(block_indices,
+                                            dtype=torch.int32,
+                                            device=self.device)  # type: ignore
+        block_indices_begins_tensor = torch.tensor(block_indices_begins,
+                                                   dtype=torch.int32,
+                                                   device=self.device)  # type: ignore
+
+        max_context_len = max(context_lens)
+        max_context_len_tensor = torch.tensor(max_context_len,
+                                              dtype=torch.int32,
+                                              device=self.device)  # type: ignore
 
         attn_metadata = self.attn_backend.make_metadata(
-            is_prompt=False,
-            slot_mapping=slot_mapping,
-            seq_lens=seq_lens,
-            seq_lens_tensor=seq_lens_tensor,
-            max_seq_len=max_seq_len,
-            num_prefill_tokens=0,
-            num_decode_tokens=len(input_tokens),
-            num_prefills=0,
-            prefill_metadata=None,
-            decode_metadata=None,
-            block_tables=block_tables,
-            kv_cache_dtype=self.kv_cache_dtype,
+            context_lens = context_lens_tensor,
+            subsequence_begins = subsequence_begins_tensor,
+            block_indices = block_indices_tensor,
+            block_indices_begins = block_indices_begins_tensor,
+            max_context_len = max_context_len_tensor
         )
         return (
             input_tokens,
@@ -266,55 +248,32 @@ class OpenVINOModelRunner:
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor, OpenVINOAttentionMetadata, SamplingMetadata,
                Optional[torch.Tensor]]:
         multi_modal_input = None
-        if self.is_driver_worker:
-            # NOTE: We assume that all sequences in the group are all prompts or
-            # all decodes.
-            is_prompt = seq_group_metadata_list[0].is_prompt
-            # Prepare input tensors.
-            if is_prompt:
-                (input_tokens, input_positions, attn_metadata, seq_lens,
-                 multi_modal_input
-                 ) = self._prepare_prompt(seq_group_metadata_list)
-            else:
-                (input_tokens, input_positions,
-                 attn_metadata) = self._prepare_decode(seq_group_metadata_list)
-                seq_lens = []
-            sampling_metadata = SamplingMetadata.prepare(
-                seq_group_metadata_list,
-                seq_lens,
-                # query_lens is not needed if chunked prefill is not
-                # supported. Since OpenVINO worker doesn't support chunked prefill
-                # just use seq_lens instead.
-                seq_lens,
-                self.device,
-                pin_memory=False)
-            # Broadcast the metadata.
-            metadata_dict = {
-                "input_tokens": input_tokens,
-                "input_positions": input_positions,
-                "selected_token_indices":
-                sampling_metadata.selected_token_indices,
-            }
-            metadata_dict.update(attn_metadata.asdict_zerocopy())
-            broadcast_tensor_dict(metadata_dict, src=0)
+
+        # NOTE: We assume that all sequences in the group are all prompts or
+        # all decodes.
+        is_prompt = seq_group_metadata_list[0].is_prompt
+        # Prepare input tensors.
+        if is_prompt:
+            (input_tokens, input_positions, attn_metadata, seq_lens,
+                multi_modal_input
+                ) = self._prepare_prompt(seq_group_metadata_list)
         else:
-            metadata_dict = broadcast_tensor_dict(src=0)
-            input_tokens = metadata_dict.pop("input_tokens")
-            input_positions = metadata_dict.pop("input_positions")
-            selected_token_indices = metadata_dict.pop(
-                "selected_token_indices")
-            attn_metadata = self.attn_backend.make_metadata(**metadata_dict)
-            sampling_metadata = SamplingMetadata(
-                seq_groups=None,
-                seq_data=None,
-                seq_lens=None,
-                selected_token_indices=selected_token_indices,
-                categorized_sample_indices=None,
-                generators=None,
-            )
+            (input_tokens, input_positions,
+                attn_metadata) = self._prepare_decode(seq_group_metadata_list)
+            seq_lens = []
+
+        sampling_metadata = SamplingMetadata.prepare(
+            seq_group_metadata_list,
+            seq_lens,
+            # query_lens is not needed if chunked prefill is not
+            # supported. Since OpenVINO worker doesn't support chunked prefill
+            # just use seq_lens instead.
+            seq_lens,
+            self.device,
+            pin_memory=False)
 
         return (input_tokens, input_positions, attn_metadata,
                 sampling_metadata, multi_modal_input)

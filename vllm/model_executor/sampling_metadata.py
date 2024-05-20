@@ -191,7 +191,6 @@ def _prepare_seq_groups(
     sample_idx = 0
     # Total number of prompts from given sequence groups.
     num_prompts = 0
-    max_seq_len = max(query_lens) if query_lens else 1
 
     for i, seq_group_metadata in enumerate(seq_group_metadata_list):
         seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -237,10 +236,11 @@ def _prepare_seq_groups(
         if sampling_params.prompt_logprobs:
             selected_token_indices.extend(
                 range(model_output_idx, model_output_idx + prompt_logprob_len))
+        model_output_idx += prompt_logprob_len
         if do_sample:
             selected_token_indices.extend(
-                range(model_output_idx + prompt_logprob_len, model_output_idx + prompt_logprob_len + sample_len))
-        model_output_idx += max_seq_len
+                range(model_output_idx, model_output_idx + sample_len))
+        model_output_idx += sample_len
 
         # We now find indices for logprob computation and sampling.
         """

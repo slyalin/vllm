@@ -17,6 +17,7 @@ class _Backend(enum.Enum):
     XFORMERS = enum.auto()
     ROCM_FLASH = enum.auto()
     TORCH_SDPA = enum.auto()
+    OPENVINO = enum.auto()
     FLASHINFER = enum.auto()
 
 
@@ -42,6 +43,10 @@ def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
         logger.info("Using Torch SDPA backend.")
         from vllm.attention.backends.torch_sdpa import TorchSDPABackend
         return TorchSDPABackend
+    elif backend == _Backend.OPENVINO:
+        logger.info("Using OpenVINO Attention backend.")
+        from vllm.attention.backends.openvino import OpenVINOAttentionBackend
+        return OpenVINOAttentionBackend
     elif backend == _Backend.FLASHINFER:
         logger.info("Using Flashinfer backend.")
         logger.warning("Eager mode is enforced for the Flashinfer backend. ")
@@ -57,7 +62,7 @@ def _which_attn_to_use(dtype: torch.dtype) -> _Backend:
         return _Backend.TORCH_SDPA
 
     if is_openvino():
-        return _Backend.TORCH_SDPA
+        return _Backend.OPENVINO
 
     if is_hip():
         # AMD GPUs.
