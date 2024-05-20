@@ -5,7 +5,7 @@ from torch import nn
 
 from vllm.attention import get_attn_backend
 from vllm.attention.backends.openvino import OpenVINOAttentionMetadata
-from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
@@ -25,6 +25,7 @@ class OpenVINOModelRunner:
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
+        cache_config: CacheConfig,
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
         vision_language_config: Optional[VisionLanguageConfig],
@@ -38,23 +39,27 @@ class OpenVINOModelRunner:
         self.scheduler_config = scheduler_config
         # Currently, CPU worker doesn't support chunked prefill.
         assert self.scheduler_config.chunked_prefill_enabled is False
+        self.device_config = device_config
+        self.cache_config = cache_config
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config
         self.load_config = load_config
         self.is_driver_worker = is_driver_worker
 
-        # model_config can be None in tests/samplers/test_sampler.py.
-        # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
-        self.sliding_window = (model_config.get_sliding_window()
-                               if model_config is not None else None)
-        self.device_config = (device_config
-                              if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
 
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = model_config.get_sliding_window()
+        self.block_size = cache_config.block_size
 
         self.attn_backend = get_attn_backend(
-            self.model_config.dtype if model_config is not None else None)
+            self.model_config.get_num_attention_heads(self.parallel_config),
+            self.model_config.get_head_size(),
+            self.model_config.get_num_kv_heads(self.parallel_config),
+            self.model_config.get_sliding_window(),
+            self.model_config.dtype,
+            self.kv_cache_dtype,
+            self.block_size)
 
         # Lazy initialization.
         self.model: nn.Module  # Set after init_Model
@@ -75,8 +80,8 @@ class OpenVINOModelRunner:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[int] = []
         input_positions: List[int] = []
-        seq_lens: List[int] = [] # TODO: remove it with support of prefix_cache, chunked_prefill
-        context_lens: List[int] = []
+        seq_lens: List[int] = []
+        past_lens: List[int] = []
         subsequence_begins: List[int] = []
         block_indices: List[int] = []
         block_indices_begins: List[int] = []
@@ -97,7 +102,6 @@ class OpenVINOModelRunner:
             prompt_tokens = seq_data.get_token_ids()
             computed_len = seq_data.get_num_computed_tokens()
             prompt_len = len(prompt_tokens)
-            subsequence_len = prompt_len - computed_len
 
             input_tokens.extend(prompt_tokens)  # Token ids
             seq_lens.append(prompt_len)
@@ -107,8 +111,11 @@ class OpenVINOModelRunner:
             # is always the first token in the sequence.
             input_positions.extend(list(range(computed_len, prompt_len)))
 
-            context_lens.append(computed_len + 1) # TODO: drop adding + 1
+            past_lens.append(computed_len)
+
+            subsequence_len = prompt_len - computed_len
             subsequence_begins.append(subsequence_begins[-1] + subsequence_len)
+
             block_indices.extend(block_table)
             block_indices_begins.append(block_indices_begins[-1] + len(block_table))
 
@@ -132,9 +139,9 @@ class OpenVINOModelRunner:
                                        dtype=torch.long,
                                        device=self.device)  # type: ignore
 
-        context_lens_tensor = torch.tensor(context_lens,
-                                           dtype=torch.int32,
-                                           device=self.device)  # type: ignore
+        past_lens_tensor = torch.tensor(past_lens,
+                                        dtype=torch.int32,
+                                        device=self.device)  # type: ignore
         subsequence_begins_tensor = torch.tensor(subsequence_begins,
                                                  dtype=torch.int32,
                                                  device=self.device)  # type: ignore
@@ -145,13 +152,13 @@ class OpenVINOModelRunner:
                                                    dtype=torch.int32,
                                                    device=self.device)  # type: ignore
 
-        max_context_len = max(context_lens)
+        max_context_len = max(seq_lens)
         max_context_len_tensor = torch.tensor(max_context_len,
                                               dtype=torch.int32,
                                               device=self.device)  # type: ignore
 
         attn_metadata = self.attn_backend.make_metadata(
-            context_lens = context_lens_tensor,
+            past_lens = past_lens_tensor,
             subsequence_begins = subsequence_begins_tensor,
             block_indices = block_indices_tensor,
             block_indices_begins = block_indices_begins_tensor,
@@ -168,7 +175,7 @@ class OpenVINOModelRunner:
         input_tokens: List[int] = []
         input_positions: List[int] = []
         seq_lens: List[int] = []
-        context_lens: List[int] = []
+        past_lens: List[int] = []
         subsequence_begins: List[int] = []
         block_indices: List[int] = []
         block_indices_begins: List[int] = []
@@ -196,8 +203,8 @@ class OpenVINOModelRunner:
                     seq_len, self.sliding_window)
                 seq_lens.append(seq_len)
 
-                context_lens.append(seq_len + 1) # TODO: remove adding + 1
-                subsequence_begins.append(subsequence_begins[-1] + 1)
+                past_lens.append(position)
+                subsequence_begins.append(subsequence_begins[-1] + 1) # 1 is a number of scheduled tokens
 
                 block_table = seq_group_metadata.block_tables[seq_id]
                 if self.sliding_window is not None:
@@ -214,9 +221,9 @@ class OpenVINOModelRunner:
                                        dtype=torch.long,
                                        device=self.device)
 
-        context_lens_tensor = torch.tensor(context_lens,
-                                           dtype=torch.int32,
-                                           device=self.device)  # type: ignore
+        past_lens_tensor = torch.tensor(past_lens,
+                                        dtype=torch.int32,
+                                        device=self.device)  # type: ignore
         subsequence_begins_tensor = torch.tensor(subsequence_begins,
                                                  dtype=torch.int32,
                                                  device=self.device)  # type: ignore
@@ -227,13 +234,13 @@ class OpenVINOModelRunner:
                                                    dtype=torch.int32,
                                                    device=self.device)  # type: ignore
 
-        max_context_len = max(context_lens)
+        max_context_len = max(seq_lens)
         max_context_len_tensor = torch.tensor(max_context_len,
                                               dtype=torch.int32,
                                               device=self.device)  # type: ignore
 
         attn_metadata = self.attn_backend.make_metadata(
-            context_lens = context_lens_tensor,
+            past_lens = past_lens_tensor,
             subsequence_begins = subsequence_begins_tensor,
             block_indices = block_indices_tensor,
             block_indices_begins = block_indices_begins_tensor,

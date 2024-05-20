@@ -156,6 +156,7 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
             parallel_config,
             scheduler_config,
             device_config,
+            cache_config,
             load_config=self.load_config,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,

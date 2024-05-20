@@ -19,7 +19,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor, _prune_
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
-from vllm.utils import is_openvino_optimum_intel, STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils import is_openvino_optimum_intel
 from vllm.attention.backends.openvino import OpenVINOAttentionMetadata
 
 import openvino as ov
@@ -128,7 +128,7 @@ class OpenVINOCasualLM(nn.Module):
             model_config.model,
             export=export,
             compile=False,
-            load_in_8bit=load_in_8bit,
+            load_in_8bit=False,
             trust_remote_code=model_config.trust_remote_code
         )
 
@@ -158,7 +158,7 @@ class OpenVINOCasualLM(nn.Module):
             input_ids,
             positions,
             *flatten_kv_cache,
-            attn_metadata.context_lens,
+            attn_metadata.past_lens,
             attn_metadata.subsequence_begins,
             attn_metadata.block_indices,
             attn_metadata.block_indices_begins,

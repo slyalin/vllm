@@ -48,7 +48,7 @@ class OpenVINOAttentionBackend(AttentionBackend):
 class OpenVINOAttentionMetadata:
     """Metadata for OpenVINOAttentionBackend.
     """
-    context_lens: torch.Tensor
+    past_lens: torch.Tensor
     subsequence_begins: torch.Tensor
     block_indices: torch.Tensor
     block_indices_begins: torch.Tensor
