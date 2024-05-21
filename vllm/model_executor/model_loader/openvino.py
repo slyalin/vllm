@@ -128,7 +128,7 @@ class OpenVINOCasualLM(nn.Module):
             model_config.model,
             export=export,
             compile=False,
-            load_in_8bit=False,
+            load_in_8bit=load_in_8bit,
             trust_remote_code=model_config.trust_remote_code
         )
 

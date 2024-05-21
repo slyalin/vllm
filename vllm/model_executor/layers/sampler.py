@@ -58,7 +58,6 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
-        print(logits.shape)
         _, vocab_size = logits.shape
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
