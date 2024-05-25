@@ -82,6 +82,7 @@ class OpenVINOModelRunner:
         input_positions: List[int] = []
         seq_lens: List[int] = []
         past_lens: List[int] = []
+        query_lens: List[int] = []
         subsequence_begins: List[int] = []
         block_indices: List[int] = []
         block_indices_begins: List[int] = []
@@ -103,7 +104,18 @@ class OpenVINOModelRunner:
             computed_len = seq_data.get_num_computed_tokens()
             prompt_len = len(prompt_tokens)
 
-            input_tokens.extend(prompt_tokens)  # Token ids
+            computed_block_nums = seq_group_metadata.computed_block_nums
+            # Prefix cache was hit.
+            # Prefix is not supported with sliding_window
+            prefix_cache_hit = (computed_block_nums is not None
+                                and len(computed_block_nums) > 0
+                                and self.sliding_window is None)
+
+            if prefix_cache_hit:
+                computed_len = len(computed_block_nums) * self.block_size
+                prompt_tokens = prompt_tokens[computed_len:]
+
+            input_tokens.extend(prompt_tokens)
             seq_lens.append(prompt_len)
 
             # Token position ids
@@ -114,6 +126,7 @@ class OpenVINOModelRunner:
             past_lens.append(computed_len)
 
             subsequence_len = prompt_len - computed_len
+            query_lens.append(subsequence_len)
             subsequence_begins.append(subsequence_begins[-1] + subsequence_len)
 
             block_indices.extend(block_table)
@@ -164,8 +177,8 @@ class OpenVINOModelRunner:
             block_indices_begins = block_indices_begins_tensor,
             max_context_len = max_context_len_tensor
         )
-        return (input_tokens, input_positions, attn_metadata, seq_lens,
-                multi_modal_input)
+        return (input_tokens, input_positions, attn_metadata,
+                seq_lens, query_lens, multi_modal_input)
 
     def _prepare_decode(
         self,
@@ -196,14 +209,14 @@ class OpenVINOModelRunner:
                 input_tokens.append(generation_token)
 
                 seq_len = seq_data.get_len()
-                position = seq_len - 1
+                computed_len = position = seq_len - 1
                 input_positions.append(position)
 
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
                 seq_lens.append(seq_len)
 
-                past_lens.append(position)
+                past_lens.append(computed_len)
                 subsequence_begins.append(subsequence_begins[-1] + 1) # 1 is a number of scheduled tokens
 
                 block_table = seq_group_metadata.block_tables[seq_id]
@@ -264,21 +277,19 @@ class OpenVINOModelRunner:
         is_prompt = seq_group_metadata_list[0].is_prompt
         # Prepare input tensors.
         if is_prompt:
-            (input_tokens, input_positions, attn_metadata, seq_lens,
-                multi_modal_input
+            (input_tokens, input_positions, attn_metadata,
+                seq_lens, query_lens, multi_modal_input
                 ) = self._prepare_prompt(seq_group_metadata_list)
         else:
             (input_tokens, input_positions,
                 attn_metadata) = self._prepare_decode(seq_group_metadata_list)
             seq_lens = []
+            query_lens = []
 
         sampling_metadata = SamplingMetadata.prepare(
             seq_group_metadata_list,
             seq_lens,
-            # query_lens is not needed if chunked prefill is not
-            # supported. Since OpenVINO worker doesn't support chunked prefill
-            # just use seq_lens instead.
-            seq_lens,
+            query_lens,
             self.device,
             pin_memory=False)
 

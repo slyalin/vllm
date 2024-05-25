@@ -133,11 +133,6 @@ def _verify_and_get_scheduler_config(
 
 
 def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
-    _GB = 1 << 30
-    if config.enable_prefix_caching:
-        logger.warning("Prefix caching is not supported on OpenVINO backend, disable it.")
-        config.enable_prefix_caching = False
-
     if os.environ.get("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", "") == "u8":
         logger.warning("KV cache type is overried to u8 via VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
         config.cache_dtype = ov.Type.u8
@@ -157,6 +152,7 @@ def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
         config.block_size = 32
 
     if kv_cache_space >= 0:
+        _GB = 1 << 30
         if kv_cache_space == 0:
             config.openvino_kvcache_space_bytes = 4 * _GB  # type: ignore
             logger.warning("Environment variable VLLM_OPENVINO_KVCACHE_SPACE (GB) "
