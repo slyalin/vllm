@@ -97,6 +97,27 @@ def _require_model_export(model_id, revision=None, subfolder=None):
         return True
 
 
+def set_name(node, name):
+    # Set name for both node and output tensor (should be only one tensor, and any other names will be overriden by a given single name)
+    node.set_friendly_name(name)
+    assert node.get_output_size() == 1
+    node.get_output_tensor(0).set_names({name})
+    return node
+
+
+def _patch_selected_token_indices(model: ov.Model):
+    # Check if the last operation in the model is MatMul
+    last_node = model.output(0).get_node().input_value(0).get_node()
+    if last_node.get_type_name() == 'MatMul':
+        opset = ov.runtime.opset13
+        parameter = set_name(opset.parameter(shape=[-1], dtype=np.int64), name='selected_token_indices')
+        model.add_parameters([parameter])
+        hidden_state = last_node.input_value(0)  # TODO: Check which input is really hidden_state
+        # TODO: Track required dimension based on MatMul attributes or symbolic tracking
+        gather = opset.gather(hidden_state, parameter, opset.constant(0))
+        last_node.input(0).replace_source_output(gather.output(0))
+
+
 class OpenVINOCasualLM(nn.Module):
 
     def __init__(
@@ -134,6 +155,7 @@ class OpenVINOCasualLM(nn.Module):
 
         paged_attention_transformation(pt_model.model)
         _modify_cache_parameters(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
+        _patch_selected_token_indices(pt_model.model)
 
         # For deployment outside vLLM
         model_file_name = os.environ.get('VLLM_OPENVINO_EXPORTED_IR_NAME', '')
@@ -151,6 +173,7 @@ class OpenVINOCasualLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[Tuple[ov.Tensor, ov.Tensor]],
         attn_metadata: OpenVINOAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
         flatten_kv_cache = _flattenize_inputs(kv_caches)
 
@@ -162,7 +185,8 @@ class OpenVINOCasualLM(nn.Module):
             attn_metadata.subsequence_begins,
             attn_metadata.block_indices,
             attn_metadata.block_indices_begins,
-            attn_metadata.max_context_len
+            attn_metadata.max_context_len,
+            sampling_metadata.selected_token_indices,
         ]
 
         self.ov_request.start_async(inputs, share_inputs=True)
@@ -176,7 +200,8 @@ class OpenVINOCasualLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
+        # TODO: Put it under condition depending on the success of _patch_selected_token_indices
+        #hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
         logits = self.logits_processor(None, hidden_states, sampling_metadata)
         return logits
 
