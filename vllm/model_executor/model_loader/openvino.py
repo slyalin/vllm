@@ -109,13 +109,26 @@ def _patch_selected_token_indices(model: ov.Model):
     # Check if the last operation in the model is MatMul
     last_node = model.output(0).get_node().input_value(0).get_node()
     if last_node.get_type_name() == 'MatMul':
-        opset = ov.runtime.opset13
-        parameter = set_name(opset.parameter(shape=[-1], dtype=np.int64), name='selected_token_indices')
-        model.add_parameters([parameter])
-        hidden_state = last_node.input_value(0)  # TODO: Check which input is really hidden_state
-        # TODO: Track required dimension based on MatMul attributes or symbolic tracking
-        gather = opset.gather(hidden_state, parameter, opset.constant(0))
-        last_node.input(0).replace_source_output(gather.output(0))
+        # track axis 0 from the MatMul output to inputs to detect where to apply Gather
+        symbols = []
+        for input in last_node.inputs():
+            shape =  input.get_partial_shape()
+            for axis in range(len(shape)):
+                symbol = ov.Symbol()
+                shape[axis].set_symbol(symbol)
+                symbols.append((symbol, input, axis))
+            # FIXME: set_partial_shape is not supported, no way to set shape for a tensor in the graph
+            input.get_tensor().set_partial_shape(shape)
+        last_node.validate_and_infer_types()
+        target_symbol = last_node.get_output_partial_shape()[0]
+        matching = [s for s in symbols if s[0] == target_symbol]
+        if len(matching) == 1:
+            _, hidden_state_input, axis = matching[0]
+            opset = ov.runtime.opset13
+            parameter = set_name(opset.parameter(shape=[-1], dtype=np.int64), name='selected_token_indices')
+            model.add_parameters([parameter])
+            gather = opset.gather(hidden_state_input, parameter, opset.constant(axis))
+            hidden_state_input.replace_source_output(gather.output(0))
 
 
 class OpenVINOCasualLM(nn.Module):
